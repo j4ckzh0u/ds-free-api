@@ -88,8 +88,6 @@ Compose 配置见 [docker/docker-compose.yaml](./docker/docker-compose.yaml)。
 
 ### 免费测试账号
 
-请自行注册，可以参考 [issue #62](https://github.com/NIyueeE/ds-free-api/issues/62) 的方法。
-
 > **⚠️ 账号风控现状（2026-09）**：官方风控已大幅收紧，本仓库 README 与 issue 中历史公开的测试账号
 > **已全部失效**（`USER_IS_BANNED` / `user is muted` / `RISK_DEVICE_DETECTED`）。这不是项目 bug，
 > 而是上游针对共享账号的策略变化：

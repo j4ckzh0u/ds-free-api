@@ -82,8 +82,6 @@ The `config/` and `data/` directories are bind-mounted into the container — co
 
 ### Free Test Accounts
 
-Please register your own. You can refer to the method in [issue #62](https://github.com/NIyueeE/ds-free-api/issues/62).
-
 > **⚠️ Account risk-control status (2026-09)**: Upstream risk control has tightened significantly.
 > Every test account previously published in this README or in the issues **is now dead**
 > (`USER_IS_BANNED` / `user is muted` / `RISK_DEVICE_DETECTED`). This is not a bug in this project —
