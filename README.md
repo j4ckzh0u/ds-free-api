@@ -1,19 +1,19 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NIyueeE/ds-free-api/main/assets/logo.svg" width="81" height="66">
+  <img src="https://raw.githubusercontent.com/j4ckzh0u/ds-free-api/main/assets/logo.svg" width="81" height="66">
 </p>
 
 <h1 align="center">DS-Free-API</h1>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/NIyueeE/ds-free-api.svg"></a>
-  <img src="https://img.shields.io/github/v/release/NIyueeE/ds-free-api.svg">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/j4ckzh0u/ds-free-api.svg"></a>
+  <img src="https://img.shields.io/github/v/release/j4ckzh0u/ds-free-api.svg">
   <img src="https://img.shields.io/badge/rust-1.95.0+-93450a.svg">
-  <img src="https://github.com/NIyueeE/ds-free-api/actions/workflows/ci.yml/badge.svg">
+  <img src="https://github.com/j4ckzh0u/ds-free-api/actions/workflows/ci.yml/badge.svg">
 </p>
 <p align="center">
-  <img src="https://img.shields.io/github/stars/NIyueeE/ds-free-api.svg">
-  <img src="https://img.shields.io/github/forks/NIyueeE/ds-free-api.svg">
-  <img src="https://img.shields.io/github/last-commit/NIyueeE/ds-free-api.svg">
+  <img src="https://img.shields.io/github/stars/j4ckzh0u/ds-free-api.svg">
+  <img src="https://img.shields.io/github/forks/j4ckzh0u/ds-free-api.svg">
+  <img src="https://img.shields.io/github/last-commit/j4ckzh0u/ds-free-api.svg">
 </p>
 
 [English](README.en.md)
@@ -48,7 +48,7 @@
 
 ### 二进制使用
 
-1. 从 [releases](https://github.com/NIyueeE/ds-free-api/releases) 下载对应平台压缩包并解压
+1. 从 [releases](https://github.com/j4ckzh0u/ds-free-api/releases) 下载对应平台压缩包并解压
 2. 复制 `config.example.toml` 为 `config.toml` 并填入账号 (可选, 也可启动后在管理面板中配置)
 3. 运行 `./ds-free-api`
 4. 访问 `http://127.0.0.1:22217/admin` 设置管理密码，之后可在面板中创建 API Key 和管理账号
@@ -280,13 +280,13 @@ tool_call.extra_ends = ["<|tool_call_end|>", "</tool_calls>", "</tool_call>"]
 侧边栏折叠（状态持久化到 `localStorage`），并可作为 PWA 添加到桌面/主屏。
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NIyueeE/ds-free-api/main/assets/web_p1.png" alt="管理面板概览" width="700">
+  <img src="https://raw.githubusercontent.com/j4ckzh0u/ds-free-api/main/assets/web_p1.png" alt="管理面板概览" width="700">
   <br>
   <em>管理面板概览（Dashboard）</em>
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NIyueeE/ds-free-api/main/assets/web_p2.png" alt="配置界面" width="700">
+  <img src="https://raw.githubusercontent.com/j4ckzh0u/ds-free-api/main/assets/web_p2.png" alt="配置界面" width="700">
   <br>
   <em>配置界面（Config）</em>
 </p>

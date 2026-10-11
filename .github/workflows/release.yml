@@ -439,7 +439,7 @@ jobs:
         with:
           path: dist
           # 只取平台产物。不要下载全部 artifact：docker 任务的 BuildKit GHA 缓存
-          # 会以 `NIyueeE~ds-free-api~<hash>.dockerbuild` 形式出现在同一次运行的
+          # 会以 `j4ckzh0u~ds-free-api~<hash>.dockerbuild` 形式出现在同一次运行的
           # artifact 列表里，全量下载会让下面的 flatten 步骤因为「用文件覆盖目录」而失败。
           pattern: "{linux-*,macos-*,windows-*}"
 

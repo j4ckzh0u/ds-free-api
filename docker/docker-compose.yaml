@@ -7,7 +7,7 @@
 
 services:
   ds-free-api:
-    image: ghcr.io/niyueee/ds-free-api:latest
+    image: ghcr.io/j4ckzh0u/ds-free-api:latest
     container_name: ds-free-api
     restart: unless-stopped
     ports:

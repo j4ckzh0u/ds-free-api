@@ -16,7 +16,7 @@
 use crate::openai_adapter::types::{OpenAIModel, OpenAIModelList};
 
 const MODEL_CREATED: u64 = 1_090_108_800;
-const MODEL_OWNED_BY: &str = "deepseek-web (proxied by https://github.com/NIyueeE)";
+const MODEL_OWNED_BY: &str = "deepseek-web (proxied by https://github.com/j4ckzh0u)";
 
 /// 枚举全部可用的模型 ID（按展示顺序），值为 `model_types` 中的下标
 ///

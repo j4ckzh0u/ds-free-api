@@ -1,19 +1,19 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NIyueeE/ds-free-api/main/assets/logo.svg" width="81" height="66">
+  <img src="https://raw.githubusercontent.com/j4ckzh0u/ds-free-api/main/assets/logo.svg" width="81" height="66">
 </p>
 
 <h1 align="center">DS-Free-API</h1>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/NIyueeE/ds-free-api.svg"></a>
-  <img src="https://img.shields.io/github/v/release/NIyueeE/ds-free-api.svg">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/j4ckzh0u/ds-free-api.svg"></a>
+  <img src="https://img.shields.io/github/v/release/j4ckzh0u/ds-free-api.svg">
   <img src="https://img.shields.io/badge/rust-1.95.0+-93450a.svg">
-  <img src="https://github.com/NIyueeE/ds-free-api/actions/workflows/ci.yml/badge.svg">
+  <img src="https://github.com/j4ckzh0u/ds-free-api/actions/workflows/ci.yml/badge.svg">
 </p>
 <p align="center">
-  <img src="https://img.shields.io/github/stars/NIyueeE/ds-free-api.svg">
-  <img src="https://img.shields.io/github/forks/NIyueeE/ds-free-api.svg">
-  <img src="https://img.shields.io/github/last-commit/NIyueeE/ds-free-api.svg">
+  <img src="https://img.shields.io/github/stars/j4ckzh0u/ds-free-api.svg">
+  <img src="https://img.shields.io/github/forks/j4ckzh0u/ds-free-api.svg">
+  <img src="https://img.shields.io/github/last-commit/j4ckzh0u/ds-free-api.svg">
 </p>
 
 [中文](README.md)
@@ -40,7 +40,7 @@ A Rust API proxy that translates DeepSeek's free web chat into standard OpenAI a
 
 ### Binary Usage
 
-1. Download and extract the archive for your platform from [releases](https://github.com/NIyueeE/ds-free-api/releases)
+1. Download and extract the archive for your platform from [releases](https://github.com/j4ckzh0u/ds-free-api/releases)
 2. Copy `config.example.toml` to `config.toml` and fill in accounts (optional — you can also configure via the admin panel after startup)
 3. Run `./ds-free-api`
 4. Visit `http://127.0.0.1:22217/admin` to set an admin password, then manage API keys and accounts from the panel
@@ -284,13 +284,13 @@ The UI supports three languages (Simplified Chinese / English / Bahasa Indonesia
 (system / light / dark), a collapsible sidebar persisted to `localStorage`, and installs as a PWA.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NIyueeE/ds-free-api/main/assets/web_p1.png" alt="Dashboard Overview" width="700">
+  <img src="https://raw.githubusercontent.com/j4ckzh0u/ds-free-api/main/assets/web_p1.png" alt="Dashboard Overview" width="700">
   <br>
   <em>Dashboard overview</em>
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NIyueeE/ds-free-api/main/assets/web_p2.png" alt="Config Page" width="700">
+  <img src="https://raw.githubusercontent.com/j4ckzh0u/ds-free-api/main/assets/web_p2.png" alt="Config Page" width="700">
   <br>
   <em>Config editor page</em>
 </p>
