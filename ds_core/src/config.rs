@@ -63,4 +63,28 @@ pub struct AccountConfig {
     /// 建议**每个账号使用独立的 device_id**：设备级指纹被上游用于关联与画像，
     /// 同一指纹下挂多个账号、累计数百次请求后，账号会被禁言（`biz_code=5`）。
     pub device_id: String,
+    /// 手动令牌模式的 Bearer token（非空时**跳过登录**，直接用它鉴权）。
+    ///
+    /// 2026-10 抓包：上游登录已改为加密请求体 + MFA 邮箱验证码 + 数美验证码 +
+    /// guest PoW，纯 Rust 客户端无法自动登录；从真实浏览器登录后复制 token 填在这里。
+    pub token: String,
+    /// 手动令牌模式配套的 Cookie 串（原样作为 `Cookie` 请求头发送）。
+    ///
+    /// 从浏览器 DevTools 复制，例如
+    /// `ds_session_id=…; smidV2=…; HWWAFSESID=…`。与 token 同源（同一浏览器会话），
+    /// 空 = 不发送 Cookie 头。
+    pub cookies: String,
+    /// 账号备注名（管理面板/日志展示用，与登录无关）
+    pub remark: String,
+    /// 显式 X-Device-Id 覆盖（浏览器采集登录时自动填入真实浏览器的设备身份）。
+    ///
+    /// 空 = 按数美 `device_id` 派生（历史行为）。采集模式下 token 与浏览器会话
+    /// 同源，带上浏览器自己的 X-Device-Id 才能让「token ↔ 设备身份」与上游
+    /// 已建立的关联保持一致。
+    pub x_device_id: String,
+    /// 该账号独立的 User-Agent 覆盖（浏览器采集登录时自动填入）。
+    ///
+    /// 空 = 用全局 `user_agent`。采集会话的 UA 与 token/Cookie 同源，
+    /// 指纹一致性优于全局默认值。
+    pub user_agent: String,
 }

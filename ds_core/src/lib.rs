@@ -7,12 +7,15 @@ mod chat;
 mod config;
 
 pub use accounts::PoolError;
-pub use accounts::pool::AccountStatus;
+pub use accounts::pool::{AccountStatus, TokenRotation, account_display_label};
 pub use accounts::{
     ChatSessionInfo, ClientIdentity, DsClient, EmulationProfile, FetchSessionsData, HifConfig,
     LoginPayload,
 };
 pub use chat::{ChatRequest, ChatResponse, DeltaPrompt, FilePayload, StreamEvent};
+
+/// 服务端令牌轮换事件接收端（`DsCore::take_rotation_events` 的返回类型）
+pub type TokenRotationReceiver = tokio::sync::mpsc::UnboundedReceiver<TokenRotation>;
 pub use config::{AccountConfig, DsCoreConfig};
 
 use accounts::Accounts;
@@ -75,6 +78,23 @@ impl DsCore {
     #[must_use]
     pub fn account_statuses(&self) -> Vec<AccountStatus> {
         self.accounts.account_statuses()
+    }
+
+    /// 当前池中的账号展示标识列表（供账号同步对比增删）
+    #[must_use]
+    pub fn account_ids(&self) -> Vec<String> {
+        self.accounts.account_ids()
+    }
+
+    /// 取走服务端令牌轮换事件的接收端（仅一次；上层据此把新 token 写回 config）
+    ///
+    /// 事件只在手动令牌模式（config 里有 token）且 `check_device` 返回 rotate
+    /// 指令时产生；不取走则事件被丢弃（行为退化为仅内存轮换）。
+    #[must_use]
+    pub fn take_rotation_events(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<TokenRotation>> {
+        self.accounts.take_rotation_receiver()
     }
 
     /// 获取详细账号状态（含滑动窗口统计、请求间隔等）

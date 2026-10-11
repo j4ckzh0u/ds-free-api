@@ -11,25 +11,27 @@
 
 ### 公共请求头
 
-2026-09 无头浏览器抓包（真实 Web/App 客户端）对齐后的完整头集合。
-登录请求同样携带全部 `x-*` 头（另加 `Referer: https://chat.deepseek.com/sign_in`）：
+2026-10-10 真实浏览器抓包（Web 客户端）对齐后的完整头集合：
 
 | Header | 说明 |
 |--------|------|
-| `User-Agent` | 必填，WAF 绕过。默认 `DeepSeek/2.5.0 Android/35`（安卓 App 身份；**桌面 Chrome UA 会被 AWS WAF 以 202 challenge 拦截**，Rust 客户端无法执行 JS challenge） |
+| `User-Agent` | 必填，WAF 绕过。默认桌面 Chrome（与 `client_platform = web` / `emulation = chrome136` 自洽；`sec-ch-ua` 版本号由 UA 自动派生） |
 | `Authorization: Bearer <token>` | 鉴权请求必填 |
+| `Cookie` | 真实客户端每个请求都带浏览器会话 Cookie（`HWWAFSESTIME`/`HWWAFSESID`（华为 WAF）、`ds_session_id`、数美指纹 `smidV2`、`.thumbcache_*`）。手动令牌模式下由账号配置**作为种子灌入该账号独立的 Cookie jar**，此后每个响应的 `Set-Cookie` 由 jar 自动捕获并按域回传（与浏览器行为一致，WAF 会话自动续期） |
 | `X-Ds-Pow-Response: <base64>` | 需要 PoW 的请求必填 |
 | `X-Client-Version` | 客户端版本号（默认 `2.5.0`，与真实客户端抓包一致） |
-| `X-Client-Platform` | 客户端平台（默认 `android`） |
+| `X-Client-Platform` | 客户端平台（默认 `web`） |
 | `X-Client-Locale` | 客户端语言区域（默认 `zh_CN`） |
 | `X-Client-Bundle-Id` | 固定 `com.deepseek.chat` |
 | `X-Device-Id` | 设备级 UUID；配置留空时首启生成随机 UUID 并写回配置（每安装一个持久值），亦用于 `check_device` payload |
 | `X-Device-Model` | 设备型号，真实客户端发空串 |
 | `X-Client-Timezone-Offset` | 时区偏移，UTC+8 = `28800` |
-| `X-Hif-Leim` | **风控令牌，仅 completion（SSE）请求需要**，见下节 `0.4` |
+| `Origin: https://chat.deepseek.com` | **仅 POST 请求**（浏览器 XHR POST 固定携带，GET 不带，2026-10-10 抓包） |
+| `Referer` | `https://chat.deepseek.com/`（登录页请求为 `/sign_in`）；**completion 为会话页** `https://chat.deepseek.com/a/chat/s/<session_id>` |
+| `X-Hif-Leim` | 风控令牌，仅 completion（SSE）请求需要，见下节 `0.4`。注意 2026-10-10 抓包中真实客户端的 completion **未携带**该头（该网络下 hif 取令牌失败），说明缺失在实践中可被容忍，仍建议有值就带 |
 
 登录 payload 的 `os` 字段应与 `X-Client-Platform` 身份一致（`web` / `android`），
-由 `client_os` 配置（默认 `android`）。
+由 `client_os` 配置（默认 `web`）。
 
 ### 响应信封格式
 
@@ -72,6 +74,38 @@
 
 ## 0. 登录 login
 
+> ⚠️ **2026-10-10 实测：自动登录已不可行**。真实浏览器登录抓包显示：
+>
+> 1. `POST /users/login` 的请求体是 **AES 加密的二进制**（不再是明文 JSON），
+>    AES 密钥用 RSA 公钥加密后放 `X-Request-Encryption-Key` 请求头（base64，256 字节）；
+> 2. 正确凭据也返回 `biz_code=14 MFA_VERIFICATION_CODE_REQUIRED` + `mfa_session_id`
+>    —— **强制邮箱验证码**；
+> 3. 发验证码的 `/users/mfa/create_verification_code` 需要
+>    `X-Ds-Guest-Pow-Response`（guest PoW：`/users/create_guest_challenge` 取题，
+>    difficulty=20 前导零位，`sha3_wasm_bg.wasm` 求解）**且** body 里带数美验证码凭证
+>    （`shumei_verification.rid` + `shumei_device_id`，凭证无效返回
+>    `biz_code=2 RECAPTCHA_VERIFY_FAILED`）；
+> 4. 登录后可选注册受信设备（P-256 公钥 + ES256，180 天免 MFA）。
+>
+> 对抗数美验证码超出本项目范围 —— 因此 `ds_core` 支持**手动令牌模式**
+> （见下节 0.0）：浏览器登录一次，token/cookies 手动填入账号配置。
+> 凭据登录仍保留在代码里；上游返回 biz_code=14 时会转为终止性错误并提示改用手动令牌。
+
+### 0.0 手动令牌模式（推荐）
+
+- 账号配置填 `token`（`Authorization: Bearer <token>` 的值）与可选 `cookies`
+  （浏览器请求的完整 `Cookie` 头原值），email/mobile/password 留空；
+- 初始化**跳过登录**，仅做一次 `check_device` 对齐真实客户端启动序列（失败不阻断）；
+- `check_device` 返回 rotate 指令时同样按轮换处理（见 0.1），且新 token 会通过
+  事件通道**自动持久化回 config.toml**（重启不丢；账号按展示标识定位）；
+- Cookie 与 token 必须来自同一浏览器会话；Cookie jar 自动续期 WAF 会话，
+  completion 遇到 WAF challenge（202）时自动 GET 站点根重新领取 Cookie 并重试一次；
+- token 失效表现为请求返回 `code=40003`（invalid token）：恢复任务重试期间
+  会再次 check_device 尝试轮换，彻底失效（3 次后置 Invalid）时日志会明确提示
+  重新「浏览器采集登录」或手动更新 token。
+
+### 0.0.1 凭据登录（历史行为，当前不可用）
+
 - **URL**: `POST /api/v0/users/login`
 - **请求头**: 完整 `x-*` 客户端头集合（见「公共请求头」）+
   `Referer: https://chat.deepseek.com/sign_in`；早期版本只发 `User-Agent`
@@ -101,7 +135,8 @@
   health_check completion
 - **错误**: `biz_code=2` / `biz_msg="PASSWORD_OR_USER_NAME_IS_WRONG"`；
   `biz_code=11` / `RISK_DEVICE_DETECTED`（device_id 无效）；
-  `biz_code=10` / `USER_IS_BANNED`
+  `biz_code=10` / `USER_IS_BANNED`；
+  `biz_code=14` / `MFA_VERIFICATION_CODE_REQUIRED`（强制邮箱验证码，2026-10-10 起终态）
 
 ---
 
@@ -234,18 +269,29 @@ maxBackoffMs = 1000 * getFrozenFeature("hif_max_retry_interval_secs", 600);
 
 ---
 
-### 0.5 completion 请求体字段（2026-10-07 从前端 bundle 提取）
+### 0.5 completion 请求体字段（2026-10-10 真实抓包逐字节核对）
 
-真实客户端的 `/chat/completion` 请求体固定包含：
+真实客户端的 `/chat/completion` 请求体（会话首条消息，Content-Length 逐字节核对一致）：
 
-```js
-{ chat_session_id, parent_message_id, model_type, prompt, ref_file_ids,
-  thinking_enabled, search_enabled, source, action, preempt }
+```json
+{ "chat_session_id": "…", "parent_message_id": null, "model_type": "default",
+  "prompt": "…", "ref_file_ids": [], "thinking_enabled": true,
+  "search_enabled": true, "action": null, "preempt": false }
 ```
 
-- **`source`**：*用户如何发出这条消息* —— `input`（输入框回车）/ `click`（发送按钮）/
-  `keyboard` / `paste` / `drag` / `file_picker` / `search` / `landing` / `api` 等。
-  代理侧统一填 `input`（真实用户最常态的路径）。
+会话内**后续消息**（2026-10-10 抓包第 2/3 条）：
+
+```json
+{ "chat_session_id": "…", "parent_message_id": 2, "model_type": null, "prompt": "…", … }
+```
+
+- **`parent_message_id`**：首条为 `null`（**显式序列化，不省略**）；后续为上一条
+  `ready` 事件返回的 `response_message_id`。
+- **`model_type`**：首条消息带值（如 `"default"`）；后续消息为 `null`
+  （服务端沿用会话首条的设定）。
+- **`source` 已不存在**：2026-10-07 前端 bundle 提取的 `source` 字段在
+  2026-10-10 的真实请求中**不再发送**（前端 2026-10-10 05:42 更新后移除）。
+  `ds_core` 已同步移除该字段 —— 以真实抓包为准。
 - **`prompt`**：**只包含最新一条用户消息的文本**。历史不在 prompt 里 ——
   它保存在服务端会话中，靠 `parent_message_id` 串联（前端 bundle 中**没有任何**
   `<｜Role｜>` 之类标签字面量）。本代理在 `session_policy = reuse` 且纯对话形态下也已
@@ -351,7 +397,8 @@ maxBackoffMs = 1000 * getFrozenFeature("hif_max_retry_interval_secs", 600);
 
 - **URL**: `POST /api/v0/chat/completion`
 - **请求头**: `Authorization`, `User-Agent`, `X-Ds-Pow-Response`（每次请求必须重新计算）,
-  **`X-Hif-Leim`（风控令牌，见 `0.4`；缺失即暴露非官方客户端）**
+  `X-Hif-Leim`（风控令牌，见 `0.4`；注意 2026-10-10 抓包中真实客户端未携带该头仍正常出流，
+  取不到时缺失可被容忍，但建议有值就带）
 - **请求体**:
 
 ```json

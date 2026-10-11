@@ -340,15 +340,15 @@ impl Chat {
             };
 
             let payload = CompletionPayload {
+                // 非首条消息：model_type 置 null（服务端沿用首条的设定，抓包 2026-10-10）
+                model_type: parent_message_id.is_none().then(|| req.model_type.clone()),
                 chat_session_id: session_id.clone(),
                 parent_message_id,
-                model_type: req.model_type.clone(),
                 prompt: chunk.clone(),
                 ref_file_ids: vec![],
                 thinking_enabled: false,
                 search_enabled: false,
                 action: None,
-                source: crate::accounts::COMPLETION_SOURCE_INPUT,
                 preempt: false,
             };
 
@@ -413,15 +413,15 @@ impl Chat {
         };
 
         let payload = CompletionPayload {
+            // 末 chunk 是本会话的第 N 条消息：N>1 时 model_type 置 null（抓包 2026-10-10）
+            model_type: parent_message_id.is_none().then(|| req.model_type.clone()),
             chat_session_id: session_id.clone(),
             parent_message_id,
-            model_type: req.model_type.clone(),
             prompt: last_chunk,
             ref_file_ids: vec![],
             thinking_enabled: req.thinking_enabled,
             search_enabled: req.search_enabled,
             action: None,
-            source: crate::accounts::COMPLETION_SOURCE_INPUT,
             preempt: false,
         };
 
@@ -717,15 +717,15 @@ impl Chat {
         };
 
         let payload = CompletionPayload {
+            // 复用会话续聊时 model_type 置 null（服务端沿用首条的设定，抓包 2026-10-10）
+            model_type: reuse_parent.is_none().then(|| req.model_type.clone()),
             chat_session_id: session_id.clone(),
             parent_message_id: reuse_parent,
-            model_type: req.model_type.clone(),
             prompt: completion_prompt.to_string(),
             ref_file_ids,
             thinking_enabled: req.thinking_enabled,
             search_enabled: req.search_enabled,
             action: None,
-            source: crate::accounts::COMPLETION_SOURCE_INPUT,
             preempt: false,
         };
 

@@ -14,10 +14,10 @@ use tokio::sync::RwLock;
 use crate::CoreError;
 use crate::config::{AccountConfig, DsCoreConfig};
 pub use client::{
-    COMPLETION_SOURCE_INPUT, ChatSessionInfo, ClientError, ClientIdentity, CompletionPayload,
-    DsClient, EmulationProfile, FetchSessionsData, HifConfig, LoginPayload, StopStreamPayload,
+    ChatSessionInfo, ClientError, ClientIdentity, CompletionPayload, DsClient, EmulationProfile,
+    FetchSessionsData, HifConfig, LoginPayload, StopStreamPayload,
 };
-pub use pool::{Account, AccountGuard, AccountPool, AccountStatus, PoolError};
+pub use pool::{Account, AccountGuard, AccountPool, AccountStatus, PoolError, TokenRotation};
 pub use pow::{PowError, PowSolver};
 
 /// 由配置构造 HTTP 客户端（客户端拟态身份 + HIF 风控令牌端点）
@@ -35,6 +35,8 @@ fn build_client(config: &DsCoreConfig) -> DsClient {
             device_model: config.client_device_model.clone(),
             timezone_offset: config.client_timezone_offset.clone(),
             client_os: config.client_os.clone(),
+            // Cookie 是账号级（与该账号的浏览器会话绑定），基础客户端不带
+            cookies: String::new(),
         },
         &HifConfig {
             enabled: config.hif_enabled,
@@ -253,6 +255,18 @@ impl Accounts {
 
     pub fn account_statuses(&self) -> Vec<AccountStatus> {
         self.pool.account_statuses()
+    }
+
+    /// 当前池中的账号展示标识列表（供账号同步对比增删）
+    pub fn account_ids(&self) -> Vec<String> {
+        self.pool.account_ids()
+    }
+
+    /// 取走服务端令牌轮换事件的接收端（仅一次；上层写回 config.toml）
+    pub fn take_rotation_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<TokenRotation>> {
+        self.pool.take_rotation_receiver()
     }
 
     pub fn account_statuses_detailed(&self) -> Vec<AccountStatus> {

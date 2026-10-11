@@ -59,6 +59,11 @@ async fn main() -> anyhow::Result<()> {
             area_code: a.area_code.clone(),
             password: a.password.clone(),
             device_id: a.device_id.clone(),
+            token: a.token.clone(),
+            cookies: a.cookies.clone(),
+            remark: a.remark.clone(),
+            x_device_id: a.x_device_id.clone(),
+            user_agent: a.user_agent.clone(),
         })
         .collect();
 

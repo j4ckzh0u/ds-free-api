@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use futures::TryStreamExt;
 use futures::future::join_all;
 use log::{debug, error, info, warn};
+use tokio::sync::mpsc;
 use tokio::sync::{RwLock, Semaphore};
 
 use super::client::{ClientError, CompletionPayload, DsClient, LoginPayload};
@@ -108,6 +109,8 @@ pub struct Account {
     token: std::sync::RwLock<Arc<str>>,
     email: String,
     mobile: String,
+    /// 展示标识：email → mobile → `token-<前8位>`（手动令牌模式）
+    label: String,
     state: AtomicU8,
     /// 账号最近一次释放的时间戳（ms），用于冷却判断
     last_released: AtomicI64,
@@ -127,7 +130,8 @@ pub struct Account {
     /// 真实 Web 客户端「一个浏览器 profile = 一个数美 device_id + 一个
     /// X-Device-Id」，HIF 风控令牌也按设备下发；这里按账号派生，
     /// 避免多账号共用同一设备身份与同一令牌。
-    client: DsClient,
+    /// RwLock：重登成功后会被替换为新的账号视图（新 jar / 新令牌）。
+    client: std::sync::RwLock<DsClient>,
 }
 
 /// 复用会话槽里的一条记录
@@ -334,11 +338,7 @@ impl Account {
     }
 
     pub fn display_id(&self) -> &str {
-        if self.email.is_empty() {
-            &self.mobile
-        } else {
-            &self.email
-        }
+        &self.label
     }
 
     pub fn state(&self) -> AccountState {
@@ -380,13 +380,14 @@ impl Account {
             token: std::sync::RwLock::new(String::new().into()),
             email: creds.email.clone(),
             mobile: creds.mobile.clone(),
+            label: display_label(&creds),
             state: AtomicU8::new(AccountState::Invalid as u8),
             last_released: AtomicI64::new(0),
             error_count: AtomicU8::new(MAX_ERROR_COUNT),
             creds,
             window: SlidingWindowRateLimiter::new(),
             session: Mutex::new(None),
-            client: scoped,
+            client: std::sync::RwLock::new(scoped),
         }
     }
 
@@ -401,9 +402,12 @@ pub struct AccountGuard {
 }
 
 impl Account {
-    /// 该账号的设备身份视图（X-Device-Id + 对应设备的 HIF 令牌）
+    /// 该账号的设备身份视图（X-Device-Id + 对应设备的 HIF 令牌 + 独立 Cookie jar）
     pub(crate) fn client(&self) -> DsClient {
-        self.client.clone()
+        self.client
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -438,6 +442,16 @@ impl Drop for AccountGuard {
     }
 }
 
+/// 服务端令牌轮换事件（`check_device` 的 rotate 指令被采纳时发出）
+///
+/// 仅手动令牌模式（config 里有 token）需要上层持久化：把新 token 写回
+/// config.toml，否则重启后会拿旧 token。
+#[derive(Debug, Clone)]
+pub struct TokenRotation {
+    pub account: String,
+    pub new_token: String,
+}
+
 pub struct AccountPool {
     /// 每账号每小时请求上限（0 = 不限制）
     hourly_quota: u64,
@@ -451,6 +465,9 @@ pub struct AccountPool {
     accounts: DashMap<String, Arc<Account>>,
     client: RwLock<Option<DsClient>>,
     solver: RwLock<Option<PowSolver>>,
+    /// 令牌轮换事件发送端；接收端由上层取走（写回 config.toml）
+    rotation_tx: Mutex<Option<mpsc::UnboundedSender<TokenRotation>>>,
+    rotation_rx: Mutex<Option<mpsc::UnboundedReceiver<TokenRotation>>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -486,6 +503,7 @@ pub enum PoolError {
 
 impl AccountPool {
     pub fn new(hourly_quota: u64, startup_health_check: bool) -> Self {
+        let (rotation_tx, rotation_rx) = mpsc::unbounded_channel();
         Self {
             hourly_quota,
             startup_health_check,
@@ -495,7 +513,17 @@ impl AccountPool {
             accounts: DashMap::new(),
             client: RwLock::new(None),
             solver: RwLock::new(None),
+            rotation_tx: Mutex::new(Some(rotation_tx)),
+            rotation_rx: Mutex::new(Some(rotation_rx)),
         }
+    }
+
+    /// 取走令牌轮换事件的接收端（仅一次；上层据此把新 token 持久化）
+    pub fn take_rotation_receiver(&self) -> Option<mpsc::UnboundedReceiver<TokenRotation>> {
+        self.rotation_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     /// 配置会话复用策略（链式调用，默认关闭）
@@ -553,22 +581,31 @@ impl AccountPool {
 
         // 限制并发初始化数，避免对 DeepSeek 端和本地连接池造成压力
         let semaphore = Arc::new(Semaphore::new(13));
+        let rotation_tx = self
+            .rotation_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let futures: Vec<_> = creds
             .into_iter()
             .map(|creds| {
                 let client = client.clone();
                 let solver = solver.clone();
                 let sem = semaphore.clone();
+                let rotation = rotation_tx.clone();
                 let startup_health_check = self.startup_health_check;
                 async move {
                     let _permit = sem.acquire().await.expect("信号量未关闭");
-                    let display_id = if creds.email.is_empty() {
-                        creds.mobile.clone()
-                    } else {
-                        creds.email.clone()
-                    };
-                    let account =
-                        match init_account(&creds, &client, &solver, startup_health_check).await {
+                    let display_id = display_label(&creds);
+                    let account = match init_account(
+                        &creds,
+                        &client,
+                        &solver,
+                        startup_health_check,
+                        rotation.as_ref(),
+                    )
+                    .await
+                    {
                         Ok(account) => {
                             info!(target: "ds_core::accounts", "Account {display_id} initialized successfully");
                             account
@@ -610,18 +647,26 @@ impl AccountPool {
         client: &DsClient,
         solver: &PowSolver,
     ) -> Result<String, PoolError> {
-        let display_id = if creds.email.is_empty() {
-            creds.mobile.clone()
-        } else {
-            creds.email.clone()
-        };
+        let display_id = display_label(creds);
 
         // 检查是否已存在（DashMap O(1) 查找）
         if self.accounts.contains_key(&display_id) {
             return Err(PoolError::AlreadyExists(display_id));
         }
 
-        let account = init_account(creds, client, solver, self.startup_health_check).await?;
+        let rotation = self
+            .rotation_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let account = init_account(
+            creds,
+            client,
+            solver,
+            self.startup_health_check,
+            rotation.as_ref(),
+        )
+        .await?;
         let _id = account.display_id().to_string();
         self.accounts.insert(display_id.clone(), Arc::new(account));
         info!(target: "ds_core::accounts", "Account {display_id} added dynamically");
@@ -729,6 +774,17 @@ impl AccountPool {
             .collect()
     }
 
+    /// 当前池中的账号展示标识列表（= DashMap 键 = display_id）
+    ///
+    /// 账号同步（根 crate `sync_accounts`）用它对比增删；手动令牌账号的标识是
+    /// `token-<前8位>` / 备注名，不能按 email/mobile 推导。
+    pub fn account_ids(&self) -> Vec<String> {
+        self.accounts
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     /// 获取所有账号的详细状态（含统计信息）
     pub fn account_statuses_detailed(&self) -> Vec<AccountStatus> {
         self.accounts
@@ -786,7 +842,19 @@ impl AccountPool {
             ));
         }
 
-        Self::re_login_account(&account, &client, &solver, self.startup_health_check).await;
+        let rotation = self
+            .rotation_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Self::re_login_account(
+            &account,
+            &client,
+            &solver,
+            self.startup_health_check,
+            rotation.as_ref(),
+        )
+        .await;
 
         // 检查重登后状态
         let new_state = account.state();
@@ -801,13 +869,14 @@ impl AccountPool {
     /// 成功 → Idle，失败 → error_count++，≥3 则 Invalid
     /// 登录阶段的**终止性**错误：重试不会改变结果
     ///
-    /// 封禁（10）/ 禁言（5）/ 设备校验失败（11）/ 凭据错误（2）以及本地校验失败，
-    /// 反复重试只会继续打上游 —— 文档里明确「禁言后继续重试不会加速解禁，反而可能延长」。
+    /// 封禁（10）/ 禁言（5）/ 设备校验失败（11）/ 凭据错误（2）/ MFA 要求（14）
+    /// 以及本地校验失败，反复重试只会继续打上游 —— 文档里明确「禁言后继续重试
+    /// 不会加速解禁，反而可能延长」。
     const fn is_terminal_login_error(e: &PoolError) -> bool {
         match e {
             PoolError::Validation(_) => true,
             PoolError::Client(ClientError::Business { code, .. }) => {
-                matches!(code, 2 | 5 | 10 | 11)
+                matches!(code, 2 | 5 | 10 | 11 | 14)
             }
             _ => false,
         }
@@ -818,12 +887,29 @@ impl AccountPool {
         client: &DsClient,
         solver: &PowSolver,
         startup_health_check: bool,
+        rotation: Option<&mpsc::UnboundedSender<TokenRotation>>,
     ) {
         let display_id = account.display_id().to_string();
-        match try_init_account(&account.creds, client, solver, startup_health_check).await {
+        match try_init_account(
+            &account.creds,
+            client,
+            solver,
+            startup_health_check,
+            rotation,
+        )
+        .await
+        {
             Ok(new_account) => {
-                // 更新 token
+                // 更新 token 与账号客户端（新 jar / 新设备视图）
                 *account.token.write().unwrap() = new_account.token.read().unwrap().clone();
+                *account
+                    .client
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = new_account
+                    .client
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 account
                     .state
                     .store(AccountState::Idle as u8, Ordering::Relaxed);
@@ -870,11 +956,17 @@ impl AccountPool {
                 for entry in &pool.accounts {
                     let account = entry.value();
                     if account.state() == AccountState::Error {
+                        let rotation = pool
+                            .rotation_tx
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
                         Self::re_login_account(
                             account,
                             &client,
                             &solver,
                             pool.startup_health_check,
+                            rotation.as_ref(),
                         )
                         .await;
                     }
@@ -928,13 +1020,30 @@ fn warn_on_shared_device_ids(creds: &[AccountConfig]) {
     }
 }
 
-/// 账号展示标识：优先 email，回退 mobile
-fn display_id_of(creds: &AccountConfig) -> &str {
-    if creds.email.is_empty() {
-        &creds.mobile
-    } else {
-        &creds.email
+/// 账号展示标识：备注 → email → mobile → `token-<前8位>`（手动令牌模式）
+///
+/// **账号身份的唯一口径**：账号池键、日志、管理面板与根 crate 的账号同步
+/// （`sync_accounts`）必须都用它，否则带备注的账号会被同步逻辑误判
+/// （实测：同步用无备注口径会试图重复添加已在池中的账号并误删旧账号）。
+#[must_use]
+pub fn account_display_label(remark: &str, email: &str, mobile: &str, token: &str) -> String {
+    if !remark.trim().is_empty() {
+        return remark.trim().to_string();
     }
+    if !email.is_empty() {
+        email.to_string()
+    } else if !mobile.is_empty() {
+        mobile.to_string()
+    } else if !token.trim().is_empty() {
+        let prefix: String = token.trim().chars().take(8).collect();
+        format!("token-{prefix}")
+    } else {
+        "unnamed".to_string()
+    }
+}
+
+fn display_label(creds: &AccountConfig) -> String {
+    account_display_label(&creds.remark, &creds.email, &creds.mobile, &creds.token)
 }
 
 async fn init_account(
@@ -942,45 +1051,72 @@ async fn init_account(
     client: &DsClient,
     solver: &PowSolver,
     startup_health_check: bool,
+    rotation: Option<&mpsc::UnboundedSender<TokenRotation>>,
 ) -> Result<Account, PoolError> {
-    try_init_account(creds, client, solver, startup_health_check).await
+    try_init_account(creds, client, solver, startup_health_check, rotation).await
 }
 
-/// 账号的 X-Device-Id
+/// 上游 biz_code：登录要求 MFA 验证码（2026-10-10 抓包实测）
+const BIZ_CODE_MFA_REQUIRED: i64 = 14;
+/// 上游 code：token 无效（系统级错误，Envelope code 字段）
+const BIZ_CODE_TOKEN_INVALID: i64 = 40003;
+
+/// check_device / 令牌轮换检查（真实客户端登录后立即调用；失败不阻断）
 ///
-/// - 有数美 `device_id` 时按其派生：稳定、且**每个账号各不相同**（对齐真实客户端
-///   「一个浏览器 profile 一个设备」）；
-/// - 显式配置了全局 `client_device_id` 时以配置为准（多账号共用一台设备的场景）；
-/// - 都没有时回退到客户端自身的设备身份。
-fn account_x_device_id(creds: &AccountConfig, client: &DsClient) -> String {
-    if !creds.device_id.trim().is_empty() {
-        return super::client::derive_device_uuid(
-            format!("ds-free-api:x-device-id:{}", creds.device_id.trim()).as_bytes(),
+/// `rotate` 非 null 时按服务端指令轮换令牌（兼容字符串与 `{"token": …}` 两种形态）。
+async fn check_device_token(client: &DsClient, token: &str, label: &str) -> String {
+    let Ok(data) = client.check_device(token).await.inspect_err(|e| {
+        if matches!(
+            e,
+            ClientError::Business {
+                code: BIZ_CODE_TOKEN_INVALID,
+                ..
+            }
+        ) {
+            // token 彻底失效：恢复任务会重试 3 次后置 Invalid，最终仍需人工重新采集
+            error!(
+                target: "ds_core::accounts",
+                "Account {label} 的 token 已失效（40003 invalid token）：                 请在管理面板重新「浏览器采集登录」，或手动更新账号配置里的 token"
+            );
+        } else {
+            debug!(
+                target: "ds_core::accounts",
+                "Account {label} check_device failed (ignored): {e}"
+            );
+        }
+    }) else {
+        return token.to_string();
+    };
+    let Some(rotate) = data.rotate.as_ref() else {
+        debug!(
+            target: "ds_core::accounts",
+            "Account {label} check_device ok (no rotation)"
         );
-    }
-    client.device_id().to_string()
+        return token.to_string();
+    };
+    let Some(new_token) = super::client::extract_rotate_token(rotate) else {
+        debug!(
+            target: "ds_core::accounts",
+            "Account {label} check_device rotate 形态未知，保持原令牌: {rotate}"
+        );
+        return token.to_string();
+    };
+    debug!(
+        target: "ds_core::accounts",
+        "Account {label} token rotated via check_device"
+    );
+    new_token
 }
 
-async fn try_init_account(
+/// 凭据登录：email/mobile + password，返回（可能经轮换的）Bearer token
+///
+/// 上游返回 biz_code=14（MFA 验证码）时转为终止性 Validation 错误并指向手动令牌模式 ——
+/// 重试只会重复失败（登录已需加密请求体 + MFA + 数美验证码）。
+async fn login_with_credentials(
     creds: &AccountConfig,
     client: &DsClient,
-    solver: &PowSolver,
-    startup_health_check: bool,
-) -> Result<Account, PoolError> {
-    // 验证：email 和 mobile 至少一个非空
-    if creds.email.is_empty() && creds.mobile.is_empty() {
-        return Err(PoolError::Validation(
-            "email 和 mobile 不能同时为空".to_string(),
-        ));
-    }
-
-    // 设备身份按账号派生（空 device_id 时回退到全局配置的 X-Device-Id）
-    let x_device_id = account_x_device_id(creds, client);
-    let client = &client.scoped_to(&x_device_id);
-    // 真实客户端在启动时就取好该设备的 HIF 令牌；这里同样预热，
-    // 失败不阻断（与客户端轮询失败时的行为一致）
-    client.warm_up_hif().await;
-
+) -> Result<String, PoolError> {
+    let label = display_label(creds);
     let login_payload = LoginPayload {
         email: creds.email.clone(),
         mobile: creds.mobile.clone(),
@@ -990,7 +1126,23 @@ async fn try_init_account(
         os: client.client_os().to_string(),
     };
 
-    let login_data = client.login(&login_payload).await?;
+    let login_data = client.login(&login_payload).await.map_err(|e| {
+        if matches!(
+            &e,
+            ClientError::Business {
+                code: BIZ_CODE_MFA_REQUIRED,
+                ..
+            }
+        ) {
+            PoolError::Validation(
+                "上游登录已要求 MFA 验证码（biz_code=14），自动登录不可行；\
+                 请在浏览器登录后把 token（及 cookies）填入账号配置的手动令牌字段"
+                    .to_string(),
+            )
+        } else {
+            PoolError::Client(e)
+        }
+    })?;
     debug!(
         target: "ds_core::client",
         "登录响应: code={}, msg={}, user_id={}, email={:?}, mobile={:?}, muted={:?}, mute_until={:?}",
@@ -1010,8 +1162,7 @@ async fn try_init_account(
     {
         error!(
             target: "ds_core::accounts",
-            "Account {} is muted until {:?} (detected at login)",
-            display_id_of(creds),
+            "Account {label} is muted until {:?} (detected at login)",
             chat.mute_until
         );
         return Err(PoolError::Validation(format!(
@@ -1020,46 +1171,94 @@ async fn try_init_account(
         )));
     }
 
-    let mut token = login_data.user.token;
+    Ok(check_device_token(client, &login_data.user.token, &label).await)
+}
 
-    // 设备校验 / 令牌轮换：真实客户端登录成功后立即调用
-    match client.check_device(&token).await {
-        Ok(data) => {
-            if let Some(rotate) = data.rotate.as_ref() {
-                match super::client::extract_rotate_token(rotate) {
-                    Some(new_token) => {
-                        debug!(
-                            target: "ds_core::accounts",
-                            "Account {} token rotated via check_device",
-                            display_id_of(creds)
-                        );
-                        token = new_token;
-                    }
-                    None => debug!(
-                        target: "ds_core::accounts",
-                        "Account {} check_device rotate 形态未知，保持原令牌: {}",
-                        display_id_of(creds),
-                        rotate
-                    ),
-                }
-            } else {
-                debug!(
-                    target: "ds_core::accounts",
-                    "Account {} check_device ok (no rotation)",
-                    display_id_of(creds)
-                );
-            }
-        }
-        // check_device 失败不阻断初始化（真实客户端亦非关键路径）
-        Err(e) => debug!(
-            target: "ds_core::accounts",
-            "Account {} check_device failed (ignored): {}",
-            display_id_of(creds),
-            e
-        ),
+/// 手动令牌模式：跳过登录，仅做一次 check_device 对齐真实客户端启动序列
+///
+/// token 由用户从真实浏览器登录后复制（2026-10 抓包起自动登录不再可行）；
+/// token 失效会在首个请求上暴露，由池的 Error/重试逻辑兜底。
+async fn adopt_manual_token(creds: &AccountConfig, client: &DsClient) -> String {
+    let label = display_label(creds);
+    debug!(
+        target: "ds_core::accounts",
+        "Account {label} 使用手动令牌模式（跳过登录）"
+    );
+    let token = creds.token.trim().to_string();
+    check_device_token(client, &token, &label).await
+}
+
+/// 账号的 X-Device-Id
+///
+/// - 浏览器采集登录填入了显式 `x_device_id` 时直接使用（与 token 的浏览器会话
+///   同一设备身份，保持上游已建立的 token ↔ 设备关联）；
+/// - 有数美 `device_id` 时按其派生：稳定、且**每个账号各不相同**（对齐真实客户端
+///   「一个浏览器 profile 一个设备」）；
+/// - 显式配置了全局 `client_device_id` 时以配置为准（多账号共用一台设备的场景）；
+/// - 都没有时回退到客户端自身的设备身份。
+fn account_x_device_id(creds: &AccountConfig, client: &DsClient) -> String {
+    let explicit = creds.x_device_id.trim();
+    if !explicit.is_empty() {
+        return explicit.to_string();
+    }
+    if !creds.device_id.trim().is_empty() {
+        return super::client::derive_device_uuid(
+            format!("ds-free-api:x-device-id:{}", creds.device_id.trim()).as_bytes(),
+        );
+    }
+    client.device_id().to_string()
+}
+
+async fn try_init_account(
+    creds: &AccountConfig,
+    client: &DsClient,
+    solver: &PowSolver,
+    startup_health_check: bool,
+    rotation: Option<&mpsc::UnboundedSender<TokenRotation>>,
+) -> Result<Account, PoolError> {
+    let manual = !creds.token.trim().is_empty();
+
+    // 验证：凭据模式要求 email/mobile 至少一个非空；手动令牌模式只看 token
+    if !manual && creds.email.is_empty() && creds.mobile.is_empty() {
+        return Err(PoolError::Validation(
+            "email 和 mobile 不能同时为空（若使用手动令牌模式请填写 token）".to_string(),
+        ));
     }
 
-    let display_id = display_id_of(creds);
+    // 账号专属视图：独立连接池 + 独立 Cookie jar（种子 = 配置的 Cookie 串）。
+    // 设备身份按账号派生（浏览器采集填入显式 x_device_id 时直接采用）；
+    // Cookie 与 token 同源（同一浏览器会话），UA 采集时与浏览器一致
+    let x_device_id = account_x_device_id(creds, client);
+    let client = &client.account_view(&x_device_id, &creds.cookies, &creds.user_agent);
+    // 真实客户端在启动时就取好该设备的 HIF 令牌；这里同样预热，
+    // 失败不阻断（与客户端轮询失败时的行为一致）
+    client.warm_up_hif().await;
+
+    let label = display_label(creds);
+    let token = if manual {
+        adopt_manual_token(creds, client).await
+    } else {
+        login_with_credentials(creds, client).await?
+    };
+
+    // 服务端要求的令牌轮换（check_device rotate）通知上层持久化：
+    // 仅手动令牌模式（配置里有 token）需要写回 config.toml
+    if !creds.token.trim().is_empty()
+        && token != creds.token.trim()
+        && let Some(tx) = rotation
+    {
+        if let Err(e) = tx.send(TokenRotation {
+            account: label.clone(),
+            new_token: token.clone(),
+        }) {
+            warn!(target: "ds_core::accounts", "令牌轮换事件发送失败: {e}");
+        } else {
+            info!(
+                target: "ds_core::accounts",
+                "Account {label} token rotated by server; 已通知上层持久化"
+            );
+        }
+    }
 
     // 健康检查：创建临时 session → 发送 test completion → 删除 session
     //
@@ -1067,9 +1266,7 @@ async fn try_init_account(
     // 而账号可用性已由「登录成功 + 禁言早检（biz_code 5）」保证。
     if startup_health_check {
         let session_id = client.create_session(&token).await?;
-        if let Err(e) =
-            health_check(&token, &session_id, client, solver, "default", display_id).await
-        {
+        if let Err(e) = health_check(&token, &session_id, client, solver, "default", &label).await {
             // 即使健康检查失败也要清理 session
             if let Err(cleanup_err) = client.delete_session(&token, &session_id).await {
                 log::warn!(
@@ -1088,7 +1285,7 @@ async fn try_init_account(
     } else {
         debug!(
             target: "ds_core::accounts",
-            "Account {display_id} 跳过启动健康检查（startup_health_check = false）"
+            "Account {label} 跳过启动健康检查（startup_health_check = false）"
         );
     }
 
@@ -1096,13 +1293,14 @@ async fn try_init_account(
         token: std::sync::RwLock::new(token.into()),
         email: creds.email.clone(),
         mobile: creds.mobile.clone(),
+        label,
         state: AtomicU8::new(AccountState::Idle as u8),
         last_released: AtomicI64::new(0),
         error_count: AtomicU8::new(0),
         creds: creds.clone(),
         window: SlidingWindowRateLimiter::new(),
         session: Mutex::new(None),
-        client: client.clone(),
+        client: std::sync::RwLock::new(client.clone()),
     })
 }
 
@@ -1146,13 +1344,12 @@ async fn health_check(
     let payload = CompletionPayload {
         chat_session_id: session_id.to_string(),
         parent_message_id: None,
-        model_type: model_type.to_string(),
+        model_type: Some(model_type.to_string()),
         prompt: health_check_prompt(),
         ref_file_ids: vec![],
         thinking_enabled: false,
         search_enabled: false,
         action: None,
-        source: super::client::COMPLETION_SOURCE_INPUT,
         preempt: false,
     };
 
@@ -1215,6 +1412,11 @@ mod tests {
             area_code: String::new(),
             password: "pw".to_string(),
             device_id: device_id.to_string(),
+            token: String::new(),
+            cookies: String::new(),
+            remark: String::new(),
+            x_device_id: String::new(),
+            user_agent: String::new(),
         }
     }
 
@@ -1425,14 +1627,79 @@ mod tests {
             token: std::sync::RwLock::new("t".into()),
             email: email.to_string(),
             mobile: String::new(),
+            label: email.to_string(),
             state: AtomicU8::new(AccountState::Idle as u8),
             last_released: AtomicI64::new(0),
             error_count: AtomicU8::new(0),
             creds: account(email, "dev"),
             window: SlidingWindowRateLimiter::new(),
             session: Mutex::new(None),
-            client: test_client(),
+            client: std::sync::RwLock::new(test_client()),
         })
+    }
+
+    /// 展示标识：email → mobile → token 前缀（手动令牌模式可辨识）
+    #[test]
+    fn display_label_falls_back_to_token_prefix() {
+        let mut creds = account("a@example.com", "dev");
+        assert_eq!(display_label(&creds), "a@example.com");
+        creds.email = String::new();
+        creds.mobile = "13800138000".to_string();
+        assert_eq!(display_label(&creds), "13800138000");
+        // 手动令牌模式：email/mobile 均空，用 token 前 8 位做标识
+        creds.mobile = String::new();
+        creds.token = "AbCdEfGhIjKlMnOpQrStUvWx".to_string();
+        assert_eq!(display_label(&creds), "token-AbCdEfGh");
+        // 备注名优先级最高（浏览器采集登录支持备注）
+        creds.remark = "主力账号".to_string();
+        assert_eq!(display_label(&creds), "主力账号");
+        // 全空（配置非法）兜底，不得 panic
+        creds.remark = String::new();
+        creds.token = String::new();
+        assert_eq!(display_label(&creds), "unnamed");
+    }
+
+    /// 浏览器采集填入的显式 x_device_id 优先于派生逻辑
+    #[test]
+    fn explicit_x_device_id_wins_over_derivation() {
+        let client = test_client();
+        let mut creds = account("a@example.com", "shumei-dev");
+        creds.x_device_id = "5512ebd8-9df7-4418-9534-578bd772f5e3".to_string();
+        let id = account_x_device_id(&creds, &client);
+        assert_eq!(id, "5512ebd8-9df7-4418-9534-578bd772f5e3");
+        // 空 x_device_id 时回退到数美 device_id 派生
+        creds.x_device_id = "  ".to_string();
+        assert_eq!(
+            account_x_device_id(&creds, &client),
+            account_x_device_id(&account("a@example.com", "shumei-dev"), &client)
+        );
+    }
+
+    /// 展示标识函数是纯函数，供根 crate 账号同步复用；备注优先
+    #[test]
+    fn account_display_label_matches_pool_logic() {
+        assert_eq!(
+            account_display_label("", "", "", "AbCdEfGhIjKlMnOpQrStUvWx"),
+            "token-AbCdEfGh"
+        );
+        assert_eq!(account_display_label("", "a@x.com", "", ""), "a@x.com");
+        assert_eq!(
+            account_display_label("", "", "13800138000", "t"),
+            "13800138000"
+        );
+        // 备注优先：与池内 display_label 完全同口径（sync 的关键约束）
+        assert_eq!(account_display_label("主号", "a@x.com", "", "tok"), "主号");
+    }
+
+    /// MFA 要求（biz_code 14）是终止性登录错误：重试只会重复失败
+    #[test]
+    fn mfa_required_is_terminal() {
+        assert!(AccountPool::is_terminal_login_error(&PoolError::Client(
+            ClientError::Business {
+                code: 14,
+                msg: "MFA_VERIFICATION_CODE_REQUIRED".to_string(),
+            }
+        )));
     }
 
     #[test]

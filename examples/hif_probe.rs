@@ -22,6 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             device_model: String::new(),
             timezone_offset: "28800".to_string(),
             client_os: "android".to_string(),
+            cookies: String::new(),
         },
         &HifConfig::default(),
         ds_core::EmulationProfile::default(),

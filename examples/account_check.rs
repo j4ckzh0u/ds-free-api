@@ -31,6 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             device_model: config.ds_core.client_device_model.clone(),
             timezone_offset: config.ds_core.client_timezone_offset.clone(),
             client_os: config.ds_core.client_os.clone(),
+            cookies: String::new(),
         },
         &HifConfig {
             enabled: config.ds_core.hif_enabled,

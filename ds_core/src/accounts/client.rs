@@ -9,7 +9,7 @@
 
 use bytes::Bytes;
 use futures::{Stream, TryStreamExt};
-use log::warn;
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use thiserror::Error;
@@ -251,26 +251,19 @@ struct ChallengeWrapper {
 #[derive(Debug, Serialize)]
 pub struct CompletionPayload {
     pub chat_session_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// 上一条响应的消息 id；会话首条为 None（抓包中**显式序列化为 null**，不省略）
     pub parent_message_id: Option<i64>,
-    pub model_type: String,
+    /// 模型类型；会话首条消息携带（如 `"default"`），后续消息为 `null`
+    /// （服务端沿用首条的设定，抓包 2026-10-10）
+    pub model_type: Option<String>,
     pub prompt: String,
     pub ref_file_ids: Vec<String>,
     pub thinking_enabled: bool,
     pub search_enabled: bool,
     /// 真实客户端固定发送该字段（会话首条为 null）
     pub action: Option<serde_json::Value>,
-    /// 消息来源（官方前端的输入方式：`input` / `click` / `keyboard` / `paste` …）
-    ///
-    /// 2026-10-07 从前端 bundle 提取：真实客户端的 completion payload 一定带
-    /// `source`，取值是**用户如何发出这条消息**。代理侧按「键盘输入 + 发送」的
-    /// 主路径填 `input`（真实用户最常态的方式）。
-    pub source: &'static str,
     pub preempt: bool,
 }
-
-/// 代理侧统一使用的 `source` 取值（对齐真实客户端的主路径：输入框输入）
-pub const COMPLETION_SOURCE_INPUT: &str = "input";
 
 #[derive(Debug, Serialize)]
 #[allow(dead_code)]
@@ -393,6 +386,14 @@ pub struct ClientIdentity {
     pub timezone_offset: String,
     /// 登录 payload 的 os 字段
     pub client_os: String,
+    /// Cookie 种子（手动令牌模式下由账号配置提供；空 = 无种子）
+    ///
+    /// 真实客户端的每个 API 请求都带浏览器会话 Cookie（`ds_session_id`、
+    /// 数美指纹 `smidV2`、WAF 会话 `HWWAFSESID` 等，抓包 2026-10-10）。
+    /// 该值在客户端构造时**灌入 Cookie jar**，此后 jar 自动捕获每个响应的
+    /// `Set-Cookie`（WAF 会话续期等）并按域名作用域回传 —— 与浏览器行为一致。
+    /// 静态 `Cookie` 请求头由此废弃：jar 与静态头并存会出现重复 Cookie。
+    pub cookies: String,
 }
 
 impl ClientIdentity {
@@ -440,15 +441,31 @@ impl ClientIdentity {
         put("Sec-Fetch-Dest", "empty")?;
         put("Sec-Fetch-Mode", "cors")?;
         put("Sec-Fetch-Site", site.as_str())?;
-        // client hints 必须与 UA 自洽（UA 是 Windows Chrome/140）
+        // client hints 必须与 UA 自洽：版本号从 UA 的 Chrome/<maj> 提取
+        // （手动令牌模式下把 UA 改成登录浏览器时，client hints 自动跟随）
+        let major = chrome_major_from_ua(&self.user_agent);
         put(
             "Sec-Ch-Ua",
-            "\"Chromium\";v=\"140\", \"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"140\"",
+            &format!(
+                "\"Chromium\";v=\"{major}\", \"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"{major}\""
+            ),
         )?;
         put("Sec-Ch-Ua-Mobile", "?0")?;
         put("Sec-Ch-Ua-Platform", "\"Windows\"")?;
         Ok(h)
     }
+}
+
+/// 从 UA 提取 Chrome 主版本号；UA 不含 `Chrome/<digits>` 时回退 140
+///
+/// 用于派生 `sec-ch-ua` 的版本号，保证手动改 UA（如对齐登录浏览器）时
+/// client hints 不与 UA 矛盾。
+fn chrome_major_from_ua(ua: &str) -> &str {
+    ua.split("Chrome/")
+        .nth(1)
+        .and_then(|rest| rest.split('.').next())
+        .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or("140")
 }
 
 /// HIF 风控令牌配置
@@ -480,6 +497,42 @@ pub struct DsClient {
     identity: ClientIdentity,
     /// HIF 风控令牌注册表（`x-hif-leim` + `x-hif-dliq`，按设备身份分桶）；None = 已关闭
     hif: Option<std::sync::Arc<super::hif::HifRegistry>>,
+    /// 传输层拟态档位（账号视图重建客户端时复用）
+    emulation: EmulationProfile,
+    /// 全局代理（账号视图重建客户端时复用，保持出口一致）
+    proxy_url: Option<String>,
+}
+
+/// 把 Cookie 头串（`k1=v1; k2=v2`）拆成可灌入 jar 的 Set-Cookie 行
+///
+/// 浏览器复制的 Cookie 请求头没有属性；按 api_base 的主机补 `Path=/; Secure`，
+/// 变成 host-only 会话 Cookie（与浏览器为 ds_session_id 记录的形态一致）。
+/// 无法解析的片段跳过并告警。
+fn cookie_seed_lines(api_base: &str, cookies: &str) -> Vec<String> {
+    let Ok(url) = wreq::Url::parse(api_base) else {
+        return Vec::new();
+    };
+    let Some(host) = url.host_str().map(str::to_string) else {
+        return Vec::new();
+    };
+    // Secure 属性只在 https 下加：cookie_store 会拒收非安全来源的 Secure Cookie
+    let secure = if url.scheme() == "https" {
+        "; Secure"
+    } else {
+        ""
+    };
+    cookies
+        .split(';')
+        .map(str::trim)
+        .filter(|pair| {
+            let ok = !pair.is_empty() && pair.contains('=');
+            if !ok && !pair.is_empty() {
+                warn!(target: "ds_core::client", "忽略无法解析的 Cookie 片段（缺少 '='）");
+            }
+            ok
+        })
+        .map(|pair| format!("{pair}; Path=/{secure}; Domain={host}"))
+        .collect()
 }
 
 impl DsClient {
@@ -503,7 +556,17 @@ impl DsClient {
             identity.device_id = identity.device_id.trim().to_string();
         }
 
-        let http = builder.build().expect("构建 HTTP 客户端失败");
+        // Cookie jar：种子 = 配置的 Cookie 串；之后所有响应的 Set-Cookie 自动入 jar
+        let jar = std::sync::Arc::new(wreq::cookie::Jar::default());
+        for line in cookie_seed_lines(&api_base, &identity.cookies) {
+            if let Ok(url) = wreq::Url::parse(&api_base) {
+                jar.add_cookie_str(&line, &url);
+            }
+        }
+        let http = builder
+            .cookie_provider(jar)
+            .build()
+            .expect("构建 HTTP 客户端失败");
         let hif = hif.enabled.then(|| {
             let headers = identity.headers(FetchSite::CrossSite).unwrap_or_else(|e| {
                 warn!(target: "ds_core::client", "客户端头构造失败，HIF 取令牌将不带拟态头: {e}");
@@ -523,6 +586,8 @@ impl DsClient {
             wasm_url,
             identity,
             hif,
+            emulation,
+            proxy_url: proxy_url.map(str::to_string),
         }
     }
 
@@ -546,6 +611,58 @@ impl DsClient {
             scoped.identity.device_id = x_device_id.trim().to_string();
         }
         scoped
+    }
+
+    /// 构造**账号专属视图**：独立的 HTTP 连接池 + 独立 Cookie jar
+    ///
+    /// jar 用账号配置的 Cookie 串播种（浏览器采集/手动复制的会话），此后
+    /// 每个响应的 `Set-Cookie` 由 jar 自动捕获续期 —— 每个账号一个 jar，
+    /// 等价于「一个浏览器 profile 一份 Cookie」。identity 同时覆盖设备身份
+    /// （`X-Device-Id`）与可选的账号级 User-Agent；HIF 令牌注册表与基础
+    /// 客户端共享（令牌按设备身份分桶，语义不变）。
+    ///
+    /// 与 [`DsClient::scoped_to`]（共享连接池与 jar 的轻量视图，用于测试）
+    /// 不同，账号视图是完整独立的客户端。
+    #[must_use]
+    pub fn account_view(&self, x_device_id: &str, cookies: &str, user_agent: &str) -> Self {
+        let mut identity = self.identity.clone();
+        if !x_device_id.trim().is_empty() {
+            identity.device_id = x_device_id.trim().to_string();
+        }
+        let ua = user_agent.trim();
+        if !ua.is_empty() {
+            identity.user_agent = ua.to_string();
+        }
+        identity.cookies = cookies.trim().to_string();
+
+        let mut builder = wreq::Client::builder().emulation(self.emulation.to_wreq());
+        if let Some(url) = self
+            .proxy_url
+            .as_deref()
+            .and_then(|u| wreq::Proxy::all(u).ok())
+        {
+            builder = builder.proxy(url);
+        }
+        let jar = std::sync::Arc::new(wreq::cookie::Jar::default());
+        for line in cookie_seed_lines(&self.api_base, &identity.cookies) {
+            if let Ok(url) = wreq::Url::parse(&self.api_base) {
+                jar.add_cookie_str(&line, &url);
+            }
+        }
+        let http = builder
+            .cookie_provider(jar)
+            .build()
+            .expect("构建 HTTP 客户端失败");
+
+        Self {
+            http,
+            api_base: self.api_base.clone(),
+            wasm_url: self.wasm_url.clone(),
+            identity,
+            hif: self.hif.clone(),
+            emulation: self.emulation,
+            proxy_url: self.proxy_url.clone(),
+        }
     }
 
     /// 当前视图的设备身份（X-Device-Id）
@@ -578,6 +695,19 @@ impl DsClient {
         self.identity.headers(FetchSite::SameOrigin)
     }
 
+    /// POST 请求的通用头 = 通用头 + `Origin`
+    ///
+    /// 浏览器对同源 XHR **POST** 固定携带 `Origin: https://chat.deepseek.com`，
+    /// GET 不带（抓包 2026-10-10）；缺失会让上游看到「非浏览器形态的 POST」。
+    fn client_post_headers(&self) -> Result<wreq::header::HeaderMap, ClientError> {
+        let mut h = self.client_headers()?;
+        h.insert(
+            wreq::header::ORIGIN,
+            wreq::header::HeaderValue::from_static("https://chat.deepseek.com"),
+        );
+        Ok(h)
+    }
+
     /// 在 completion（SSE）请求上追加风控令牌头（`x-hif-leim` + `x-hif-dliq`）
     ///
     /// 真实客户端只在 SSE 请求上带这两个头（前端 `addSSEHeader`），
@@ -600,12 +730,24 @@ impl DsClient {
         Ok(h)
     }
 
-    fn auth_headers_with_pow(
+    /// POST 请求头 = 通用头 + `Origin` + `Authorization`
+    fn auth_post_headers(&self, token: &str) -> Result<wreq::header::HeaderMap, ClientError> {
+        let mut h = self.client_post_headers()?;
+        h.insert(
+            wreq::header::AUTHORIZATION,
+            wreq::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|e| ClientError::InvalidHeader(format!("Authorization: {e}")))?,
+        );
+        Ok(h)
+    }
+
+    /// POST（SSE）请求头 = 通用头 + `Origin` + `Authorization` + PoW
+    fn auth_post_headers_with_pow(
         &self,
         token: &str,
         pow_response: &str,
     ) -> Result<wreq::header::HeaderMap, ClientError> {
-        let mut h = self.auth_headers(token)?;
+        let mut h = self.auth_post_headers(token)?;
         h.insert(
             "X-Ds-Pow-Response",
             wreq::header::HeaderValue::from_str(pow_response)
@@ -630,7 +772,7 @@ impl DsClient {
     }
 
     pub async fn login(&self, payload: &LoginPayload) -> Result<LoginData, ClientError> {
-        let mut h = self.client_headers()?;
+        let mut h = self.client_post_headers()?;
         h.insert(
             wreq::header::REFERER,
             wreq::header::HeaderValue::from_static("https://chat.deepseek.com/sign_in"),
@@ -680,7 +822,7 @@ impl DsClient {
                 "{}{}",
                 self.api_base, ENDPOINT_USERS_AUTH_TOKEN_CHECK_DEVICE
             ))
-            .headers(self.auth_headers(token)?)
+            .headers(self.auth_post_headers(token)?)
             .json(&serde_json::json!({
                 "device_id": self.identity.device_id,
                 "device_model": self.identity.device_model,
@@ -720,7 +862,7 @@ impl DsClient {
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_SESSION_CREATE))
-            .headers(self.auth_headers(token)?)
+            .headers(self.auth_post_headers(token)?)
             .json(&serde_json::json!({}))
             .send()
             .await?;
@@ -733,7 +875,7 @@ impl DsClient {
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_SESSION_DELETE))
-            .headers(self.auth_headers(token)?)
+            .headers(self.auth_post_headers(token)?)
             .json(&serde_json::json!({ "chat_session_id": session_id }))
             .send()
             .await?;
@@ -752,7 +894,7 @@ impl DsClient {
                 "{}{}",
                 self.api_base, ENDPOINT_CHAT_CREATE_POW_CHALLENGE
             ))
-            .headers(self.auth_headers(token)?)
+            .headers(self.auth_post_headers(token)?)
             .json(&serde_json::json!({ "target_path": target_path }))
             .send()
             .await?;
@@ -767,15 +909,53 @@ impl DsClient {
         pow_response: &str,
         payload: &CompletionPayload,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>, ClientError> {
-        let mut headers = self.auth_headers_with_pow(token, pow_response)?;
+        let mut headers = self.auth_post_headers_with_pow(token, pow_response)?;
+        // 真实客户端的 completion Referer 指向会话页（抓包 2026-10-10：
+        // https://chat.deepseek.com/a/chat/s/<session_id>）
+        let referer = format!(
+            "https://chat.deepseek.com/a/chat/s/{}",
+            payload.chat_session_id
+        );
+        headers.insert(
+            wreq::header::REFERER,
+            wreq::header::HeaderValue::from_str(&referer)
+                .map_err(|e| ClientError::InvalidHeader(format!("Referer: {e}")))?,
+        );
         self.attach_hif(&mut headers).await?;
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_COMPLETION))
-            .headers(headers)
+            .headers(headers.clone())
             .json(payload)
             .send()
             .await?;
+
+        // WAF 反应式刷新：会话 Cookie（HWWAFSESID）过期时上游返回 202 challenge，
+        // 此时 GET 一次站点根让 WAF 重新下发 Cookie（jar 自动捕获），再重试一次
+        let resp = if is_waf_challenge(&resp) {
+            warn!(
+                target: "ds_core::client",
+                "completion 遇到 WAF challenge，正在刷新站点 Cookie 后重试一次"
+            );
+            self.refresh_site_cookies().await;
+            let resp = self
+                .http
+                .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_COMPLETION))
+                .headers(headers)
+                .json(payload)
+                .send()
+                .await?;
+            if is_waf_challenge(&resp) {
+                print_waf_hint();
+                return Err(ClientError::Status {
+                    status: 202,
+                    body: "WAF Challenge persists after cookie refresh".into(),
+                });
+            }
+            resp
+        } else {
+            resp
+        };
 
         let status = resp.status();
         if !status.is_success() {
@@ -789,6 +969,27 @@ impl DsClient {
         Ok(Box::pin(resp.bytes_stream().map_err(ClientError::Http)))
     }
 
+    /// 访问站点根，让 WAF 重新下发会话 Cookie（jar 自动捕获 `Set-Cookie`）
+    async fn refresh_site_cookies(&self) {
+        let origin = wreq::Url::parse(&self.api_base).ok().map_or_else(
+            || "https://chat.deepseek.com".to_string(),
+            |u| u.origin().ascii_serialization(),
+        );
+        match self.http.get(&origin).send().await {
+            Ok(resp) => {
+                debug!(
+                    target: "ds_core::client",
+                    "站点 Cookie 刷新完成: {} {}",
+                    resp.status(),
+                    origin
+                );
+            }
+            Err(e) => {
+                warn!(target: "ds_core::client", "站点 Cookie 刷新请求失败: {e}");
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub async fn edit_message(
         &self,
@@ -796,7 +997,7 @@ impl DsClient {
         pow_response: &str,
         payload: &EditMessagePayload,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>, ClientError> {
-        let mut headers = self.auth_headers_with_pow(token, pow_response)?;
+        let mut headers = self.auth_post_headers_with_pow(token, pow_response)?;
         self.attach_hif(&mut headers).await?;
         let resp = self
             .http
@@ -830,7 +1031,7 @@ impl DsClient {
                 "{}{}",
                 self.api_base, ENDPOINT_CHAT_SESSION_UPDATE_TITLE
             ))
-            .headers(self.auth_headers(token)?)
+            .headers(self.auth_post_headers(token)?)
             .json(payload)
             .send()
             .await?;
@@ -847,7 +1048,7 @@ impl DsClient {
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_STOP_STREAM))
-            .headers(self.auth_headers(token)?)
+            .headers(self.auth_post_headers(token)?)
             .json(payload)
             .send()
             .await?;
@@ -872,7 +1073,7 @@ impl DsClient {
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_FILE_UPLOAD))
-            .headers(self.auth_headers_with_pow(token, pow_response)?)
+            .headers(self.auth_post_headers_with_pow(token, pow_response)?)
             .multipart(form)
             .send()
             .await?;
@@ -985,6 +1186,7 @@ mod tests {
             device_model: String::new(),
             timezone_offset: "28800".to_string(),
             client_os: "android".to_string(),
+            cookies: String::new(),
         }
     }
 
@@ -1136,6 +1338,184 @@ mod tests {
             None,
         );
         assert!(c.hif.is_none(), "关闭后不应构造 HIF 令牌提供者");
+    }
+
+    /// jar 往返集成测试：种子的 Cookie 随请求发出；响应的 Set-Cookie 被 jar
+    /// 捕获并在后续请求回传（WAF 会话自动续期的核心链路）。
+    /// 用极简 HTTP/1.1 服务器记录请求 Cookie 头并下发 Set-Cookie。
+    #[tokio::test]
+    async fn cookie_jar_roundtrip_with_seed_and_set_cookie() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let observed: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let observed_srv = observed.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let observed = observed_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let mut got = Vec::new();
+                    loop {
+                        let Ok(n) = sock.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        got.extend_from_slice(&buf[..n]);
+                        if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&got);
+                    let cookie = text
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("cookie:"))
+                        .and_then(|l| l.split_once(':'))
+                        .map(|(_, v)| v.trim().to_string())
+                        .unwrap_or_default();
+                    observed.lock().unwrap().push(cookie);
+                    let body = r#"{"code":0,"msg":"","data":{"biz_code":0,"biz_msg":"","biz_data":{"rotate":null}}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Set-Cookie: HWWAFSESID=fresh123; Path=/; HttpOnly\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    drop(sock.write_all(resp.as_bytes()).await);
+                    drop(sock.shutdown().await);
+                });
+            }
+        });
+
+        let mut identity = test_identity();
+        identity.cookies = "ds_session_id=old-value".to_string();
+        let client = DsClient::new(
+            format!("http://{addr}/api/v0"),
+            "https://example.invalid/x.wasm".to_string(),
+            identity,
+            &HifConfig {
+                enabled: false,
+                ..HifConfig::default()
+            },
+            EmulationProfile::default(),
+            None,
+        );
+
+        client.check_device("t").await.unwrap();
+        client.check_device("t").await.unwrap();
+
+        let cookies = observed.lock().unwrap();
+        assert_eq!(cookies.len(), 2, "两次请求都应到达服务器");
+        assert_eq!(cookies[0], "ds_session_id=old-value", "首请求带种子 Cookie");
+        assert!(
+            cookies[1].contains("ds_session_id=old-value"),
+            "第二次请求仍带种子 Cookie: {:?}",
+            cookies[1]
+        );
+        assert!(
+            cookies[1].contains("HWWAFSESID=fresh123"),
+            "Set-Cookie 下发的 WAF Cookie 应被 jar 捕获并回传: {:?}",
+            cookies[1]
+        );
+        drop(cookies);
+    }
+
+    /// Cookie 种子串解析：拆成带主机属性的 Set-Cookie 行；坏片段跳过
+    #[test]
+    fn cookie_seed_lines_parse_and_skip_malformed() {
+        let lines = cookie_seed_lines(
+            "https://chat.deepseek.com/api/v0",
+            "ds_session_id=abc; smidV2=xyz",
+        );
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].starts_with("ds_session_id=abc; Path=/; Secure; Domain=chat.deepseek.com")
+        );
+        assert!(lines[1].starts_with("smidV2=xyz; Path=/; Secure; Domain=chat.deepseek.com"));
+
+        // http 目标不带 Secure
+        let http_lines = cookie_seed_lines("http://127.0.0.1:1234/api/v0", "a=1");
+        assert_eq!(http_lines[0], "a=1; Path=/; Domain=127.0.0.1");
+
+        // 无 '=' 的片段被跳过；空串 → 无种子
+        assert!(cookie_seed_lines("https://chat.deepseek.com/api/v0", "flag; a=1").len() == 1);
+        assert!(cookie_seed_lines("https://chat.deepseek.com/api/v0", "   ").is_empty());
+    }
+
+    #[test]
+    fn sec_ch_ua_version_follows_user_agent() {
+        assert_eq!(
+            chrome_major_from_ua("Mozilla/5.0 (Windows NT 10.0) Chrome/140.0.0.0"),
+            "140"
+        );
+        assert_eq!(
+            chrome_major_from_ua("Mozilla/5.0 Chrome/101.0.4951.54 Safari/537.36"),
+            "101"
+        );
+        // 无 Chrome 字样 / 非数字版本 → 回退
+        assert_eq!(chrome_major_from_ua("DeepSeek/2.5.0 Android/35"), "140");
+        assert_eq!(chrome_major_from_ua("Mozilla/5.0 Chrome/abc.0"), "140");
+
+        // UA 改成 Chrome/101 时 sec-ch-ua 版本自动跟随（手动令牌模式对齐登录浏览器）
+        let mut identity = test_identity();
+        identity.user_agent =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.54 Safari/537.36".to_string();
+        let c = DsClient::new(
+            "https://chat.deepseek.com/api/v0".to_string(),
+            "https://example.com/x.wasm".to_string(),
+            identity,
+            &HifConfig {
+                enabled: false,
+                ..HifConfig::default()
+            },
+            EmulationProfile::default(),
+            None,
+        );
+        let h = c.client_headers().unwrap();
+        assert!(h["sec-ch-ua"].to_str().unwrap().contains("v=\"101\""));
+    }
+
+    /// completion payload 必须与真实抓包（2026-10-10）**逐字节**一致：
+    /// 无 `source`；首条消息 `parent_message_id: null`（显式序列化）、
+    /// `model_type` 有值；后续消息两者相反。对序列化字符串断言可同时覆盖
+    /// 字段集合、字段顺序与 null 形态（`to_value` 的 Map 会按字母序丢掉顺序）。
+    #[test]
+    fn completion_payload_matches_capture() {
+        let first = CompletionPayload {
+            chat_session_id: "1b1907d5".to_string(),
+            parent_message_id: None,
+            model_type: Some("default".to_string()),
+            prompt: "你好".to_string(),
+            ref_file_ids: vec![],
+            thinking_enabled: true,
+            search_enabled: true,
+            action: None,
+            preempt: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            "{\"chat_session_id\":\"1b1907d5\",\"parent_message_id\":null,\
+              \"model_type\":\"default\",\"prompt\":\"你好\",\"ref_file_ids\":[],\
+              \"thinking_enabled\":true,\"search_enabled\":true,\"action\":null,\
+              \"preempt\":false}"
+        );
+
+        let follow = CompletionPayload {
+            parent_message_id: Some(2),
+            model_type: None,
+            ..first
+        };
+        assert_eq!(
+            serde_json::to_string(&follow).unwrap(),
+            "{\"chat_session_id\":\"1b1907d5\",\"parent_message_id\":2,\
+              \"model_type\":null,\"prompt\":\"你好\",\"ref_file_ids\":[],\
+              \"thinking_enabled\":true,\"search_enabled\":true,\"action\":null,\
+              \"preempt\":false}"
+        );
     }
 
     #[test]
