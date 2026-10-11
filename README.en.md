@@ -31,6 +31,10 @@ A Rust API proxy that translates DeepSeek's free web chat into standard OpenAI a
 - **Web admin panel**: Built-in dashboard for account pool status, API key management, request logs, i18n (Simplified Chinese / English / Bahasa Indonesia), theme switcher, responsive layout (desktop / tablet / mobile) and PWA install — hot-reloadable config, ready out of the box
 - **Built with Rust**: Single binary + single TOML config, cross-platform native performance (web panel compiled in at build time)
 - **Multi-account pool**: Idle-aware round-robin selection (DashMap lock-free reads), horizontal scaling for concurrency
+- **Risk-control alignment (2026-10)**: `x-hif-leim` risk token per device, per-account device identity, pluggable transport emulation (`emulation`, desktop-Chrome by default), sliding-window per-account quota and mute early-check; diagnostics via `hif_probe` / `account_check` / `identity_probe`
+- **Browser capture login (2026-10-10)**: One click in the admin panel launches a local Chrome — you sign in manually (MFA / captcha done by you), the proxy captures token / cookies / device identity (X-Device-Id / UA) into the config and hot-adds the account; capturing the same browser again **renews** that account's credentials
+- **Manual token mode**: Copy a token from your browser once — email / mobile / password are optional (upstream credential login now requires MFA + captcha and no longer works)
+- **Cookie auto-renewal**: Per-account cookie jar captures `Set-Cookie` automatically (WAF sessions maintenance-free); completion retries once after re-minting cookies on a WAF challenge; server-side token rotation is persisted back to config.toml
 
 ## Quick Start
 
@@ -63,6 +67,11 @@ Refer to the [sample compose file](./docker/docker-compose.yaml) for reference.
 
 The admin panel is at `http://localhost:22217/admin`. Set your admin password on first visit.
 The `config/` and `data/` directories are bind-mounted into the container — config changes persist to the host automatically.
+
+> **No Chrome inside the container**: the "browser capture login" button is unavailable in Docker
+> deployments. Run one capture on the host (any machine with Chrome) and copy the generated
+> `[[ds_core.accounts]]` block (token / cookies / x_device_id / user_agent) into the mounted
+> `config.toml`.
 
 > **`docker/config/config.toml` is required on first deployment** (the `cp` above).
 > Published images (≤ v0.5.1) fall back to the built-in code default `host = "127.0.0.1"` when the
@@ -97,8 +106,40 @@ Please register your own. You can refer to the method in [issue #62](https://git
 > the observed "muted after only 2 requests per account" reports. Since v0.5.0 `ds_core` fetches
 > the token, refreshes it on TTL and attaches it to SSE requests (`hif_enabled = true` by default).
 > See `docs/development.md` for details.
+>
+> **⚠️ Since 2026-10-10 credential login no longer works.** Login now uses an encrypted request
+> body plus a mandatory email verification code (MFA) and a Shumei captcha — correct credentials
+> return `MFA_VERIFICATION_CODE_REQUIRED`. The `device_id` section below applies to the legacy
+> credential mode only; **use the two methods below instead**.
 
-#### How to obtain `device_id`
+### Browser Capture Login (recommended)
+
+Admin panel → Config → "Capture via Browser": the proxy launches a local Chrome with a dedicated
+persistent profile (login state and device fingerprint preserved). You sign in normally; the proxy
+listens to the post-login API requests and captures **token / cookies / X-Device-Id / User-Agent**
+into config.toml and hot-adds the account.
+
+- Same browser (same X-Device-Id) = same account: **when the token expires, click the button once to renew**;
+- Captured credentials are fully same-origin with your browser session (fingerprint / UA / cookies);
+- When a token becomes invalid the log says so explicitly — capture again to fix.
+
+### Manual Token Mode
+
+Alternatively, sign in with your browser and copy the `Authorization: Bearer <token>` and `Cookie`
+headers of any `/api/v0/*` request from DevTools:
+
+```toml
+[[ds_core.accounts]]
+token = "the Bearer token from the browser request"
+cookies = "the raw Cookie header of the same request"
+remark = "optional label"
+```
+
+The cookies seed a dedicated **cookie jar** per account — `Set-Cookie` responses are captured and
+replayed automatically (WAF sessions are maintenance-free); server-side token rotation
+(`check_device` rotate) is persisted back to the config.
+
+#### How to obtain `device_id` (legacy credential mode only)
 
 `device_id` is the device-level fingerprint produced by the Shumei SDK. Upstream uses it to link
 and profile accounts, so **each account should use its own `device_id`** (log in once per account in

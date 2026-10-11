@@ -100,7 +100,7 @@ match_bool = "deny"
 
 [package]
 name = "ds-free-api"
-version = "0.5.1"
+version = "0.6.0"
 license = "GPL-3.0-only"
 edition = "2024"
 
@@ -117,7 +117,7 @@ chrono = "0.4.44"
 # 浏览器采集登录：CDP 驱动本机 Chrome（headful），旁路监听登录后的 API 请求
 chromiumoxide = { version = "0.9.1", default-features = false, features = ["bytes"] }
 dashmap = "6"
-ds_core = { path = "ds_core", version = "0.5.1" }
+ds_core = { path = "ds_core", version = "0.6.0" }
 env_logger = { version = "0.11.10", features = ["auto-color"] }
 futures = "0.3.32"
 hmac = "0.13.0"

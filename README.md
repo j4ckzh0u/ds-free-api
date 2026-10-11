@@ -34,8 +34,15 @@
 - **Rust 实现**：单可执行文件 + 单 TOML 配置，跨平台原生高性能（Web 面板编译时嵌入，开箱即用）
 - **多账号池**：空闲最久优先轮转（DashMap 无锁读），支持水平扩展并发
 - **风控对齐（2026-10）**：按官方客户端抓包结果补齐 `x-hif-leim` 风控令牌（按设备缓存）、
-  设备身份按账号派生、传输层拟态档位可配（`emulation`，默认与 UA 自洽的原生 App 指纹）、
+  设备身份按账号派生、传输层拟态档位可配（`emulation`，默认与 UA 自洽的桌面 Chrome 指纹）、
   单账号滑动窗口配额与禁言早检；诊断入口 `hif_probe` / `account_check` / `identity_probe`
+- **浏览器采集登录（2026-10-10）**：管理面板一键拉起本机 Chrome，人工完成登录（MFA / 验证码由人
+  操作），自动采集 token / Cookie / 设备身份（X-Device-Id / UA）写回配置并热加入账号池；
+  同一浏览器再次采集即**续期**同一账号的凭据
+- **手动令牌模式**：从浏览器复制一次 token 即可使用（email / mobile / password 可省略）——
+  上游凭据自动登录已因强制 MFA + 验证码不可行
+- **Cookie 自动续期**：每账号独立 Cookie jar，`Set-Cookie` 自动捕获回传（WAF 会话免维护），
+  completion 遇 WAF challenge 自动重领 Cookie 并重试；服务端令牌轮换自动写回 config.toml
 
 ## 快速开始
 
@@ -69,6 +76,10 @@ Compose 配置见 [docker/docker-compose.yaml](./docker/docker-compose.yaml)。
 管理面板在 `http://localhost:22217/admin`，首次访问设置管理密码。
 `config/` 和 `data/` 目录通过 bind mount 挂载到容器内，配置修改自动持久化到宿主机。
 
+> **容器内没有 Chrome**：「浏览器采集登录」按钮在 Docker 部署下不可用。
+> 先在宿主机（任意有 Chrome 的机器）完成一次采集，把生成的 `[[ds_core.accounts]]`
+> 段（token / cookies / x_device_id / user_agent）复制进挂载的 `config.toml` 即可。
+
 > **首次部署必须准备 `docker/config/config.toml`**（`cp` 上面那一行）。
 > 已发布镜像（≤ v0.5.1）在配置缺失时会按代码默认值生成 `host = "127.0.0.1"` 的配置，
 > 服务只监听容器内回环，宿主机的 `22217` 端口会**连不上**（容器显示 Up 但访问无响应）。
@@ -98,8 +109,38 @@ Compose 配置见 [docker/docker-compose.yaml](./docker/docker-compose.yaml)。
 > 上游无需任何行为统计即可判定请求来自非官方客户端 —— 与「每账号仅 2 次请求也被禁言」
 > 的实测现象吻合。v0.5.0 起 `ds_core` 会自动取令牌、按 TTL 刷新并附在 SSE 请求上
 > （`hif_enabled = true`，默认开启）。细节见 `docs/development.md`。
+>
+> **⚠️ 2026-10-10 起：凭据自动登录已不可行。** 实测登录已改为加密请求体 + 强制邮箱
+> 验证码（MFA）+ 数美验证码——正确凭据也返回 `MFA_VERIFICATION_CODE_REQUIRED`。
+> 下方「如何获取 device_id」仅适用于历史凭据模式；**新部署请使用下方两种方式**。
 
-#### 如何获取 `device_id`
+### 浏览器采集登录（推荐）
+
+管理面板 → 配置页 →「浏览器采集登录」：程序拉起本机 Chrome（独立持久化 profile，
+保留登录态与设备指纹），你在窗口里正常登录，程序旁路监听登录后的 API 请求，
+自动采集 **token / Cookie / X-Device-Id / User-Agent** 写回 config.toml 并热加入账号池。
+
+- 同一浏览器（X-Device-Id 相同）视为同一账号：**token 过期后点一下按钮即续期**；
+- 采集的凭据与浏览器会话完全同源（设备指纹 / UA / Cookie 一致），自洽性最好；
+- token 彻底失效时日志会明确提示，重新采集一次即可。
+
+### 手动令牌模式
+
+不想用采集按钮时，浏览器登录后从 DevTools 复制任意 `/api/v0/*` 请求的
+`Authorization: Bearer <token>` 与 `Cookie` 头，填入账号配置（email / mobile / password
+可省略）：
+
+```toml
+[[ds_core.accounts]]
+token = "浏览器请求头里的 Bearer token"
+cookies = "同一请求的 Cookie 头原值"
+remark = "备注名（可选）"
+```
+
+Cookie 会作为种子灌入该账号**独立的 Cookie jar**，此后 `Set-Cookie` 自动捕获续期
+（WAF 会话免维护）；服务端令牌轮换（`check_device` 的 rotate 指令）会自动写回 config。
+
+#### 如何获取 `device_id`（仅历史凭据模式需要）
 
 `device_id` 是数美（Shumei）SDK 生成的设备级指纹。上游用它做账号关联与画像，
 因此**每个账号应使用各自独立的 `device_id`**（各自开一个无痕窗口 / 浏览器配置文件登录一次），

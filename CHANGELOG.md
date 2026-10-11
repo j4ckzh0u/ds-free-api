@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] - 2026-10-11
+
+### Added（2026-10-10 抓包跟进：登录风控升级的应对）
+
+- **浏览器采集登录**：管理面板一键拉起本机 Chrome（headful + 独立持久化 profile，
+  保留登录态与数美指纹），用户人工完成登录（MFA / 数美验证码由人操作），程序旁路
+  监听登录后的 `/api/v0/*` 鉴权请求，自动采集 **token / cookies / X-Device-Id /
+  User-Agent** 写回 config.toml 并热加入账号池
+  - 同一浏览器（X-Device-Id 相同）= 同一账号：再次采集**更新**其凭据（token
+    过期点一下即续期）；默认命名 `token-<前8位>`，支持备注名
+  - 采集凭据与浏览器会话完全同源（设备指纹 / UA / Cookie 一致）
+- **手动令牌模式**：账号配置 `token` 非空时跳过登录（email / mobile / password
+  可省略），仅 `check_device` 对齐真实客户端启动序列。背景：2026-10-10 实测上游
+  登录已改为**加密请求体 + 强制邮箱验证码（MFA）+ 数美验证码**，纯 Rust 客户端
+  无法自动登录（`biz_code=14` 终止性错误并提示改用手动令牌）
+- **每账号独立 Cookie jar**：配置的 `cookies` 作为种子，此后每个响应的
+  `Set-Cookie` 自动捕获并按域回传（WAF 会话免维护）；completion 遇 WAF
+  challenge（202）自动 GET 站点根重领 Cookie 并重试一次
+- **服务端令牌轮换持久化**：`check_device` 的 rotate 指令被采纳时发
+  `TokenRotation` 事件，server 消费并把新 token 写回 config.toml（不消费则
+  重启后拿旧 token）
+- token 失效（`code=40003`）日志明确提示重新采集；MFA 要求标记为终止性错误
+
+### Fixed（2026-10-10 抓包对齐）
+
+- completion payload 移除 `source` 字段（前端 2026-10-10 更新后已不发送）；
+  `parent_message_id: null` 显式序列化；会话内后续消息 `model_type: null`
+  （服务端沿用首条设定）
+- POST 请求补 `Origin: https://chat.deepseek.com`（浏览器 XHR POST 固定携带）；
+  completion 的 `Referer` 改为会话页 `…/a/chat/s/<session_id>`
+- `sec-ch-ua` 版本号从 User-Agent 自动派生（手动令牌模式下 UA 对齐登录浏览器时
+  client hints 自动跟随）
+- **`sync_accounts` 账号识别口径修复**：统一走 `account_display_label(remark,
+  email, mobile, token)`（备注优先）——此前手动令牌账号（email/mobile 空）被
+  折叠成 `""` 无法热加入账号池，带备注账号会被误判已存在并误删（实测发现）
+
 ## [Unreleased]
 
 ### ⚠️ 默认配置改为「对齐浏览器」（行为变更）
