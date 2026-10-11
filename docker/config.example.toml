@@ -13,22 +13,71 @@ port = 22217
 
 [ds_core]
 # 账号池（[[ds_core.accounts]]）
-# 邮箱登录示例
+#
+# ⚠️ 2026-10-10 抓包实测：上游登录已改为「加密请求体 + MFA 邮箱验证码 +
+#    数美验证码 + guest PoW」（biz_code=14 MFA_VERIFICATION_CODE_REQUIRED），
+#    **凭据自动登录已不可行**。推荐使用下方「手动令牌模式」：
+#    在浏览器登录 chat.deepseek.com 一次，把 token（及 cookies）复制到账号配置。
+#
+# 邮箱登录示例（⚠️ 当前会因 MFA 失败，见上）
 # [[ds_core.accounts]]
 # email = "user1@example.com"
 # mobile = ""
 # area_code = ""
 # password = "pass1"
 
-# 中国手机号登录示例
+# 中国手机号登录示例（⚠️ 当前会因 MFA 失败，见上）
 # [[ds_core.accounts]]
 # email = ""
 # mobile = "13800138000"
 # area_code = "+86"
 # password = "pass2"
 
-# 设备指纹 ID（**必填**）：缺失会被登录风控直接拒绝
-# （客户端错误: Business error: code=11, msg=RISK_DEVICE_DETECTED）
+# ── 手动令牌模式（推荐）────────────────────────────────────────────────
+#
+# token 非空时**跳过登录**，直接用该 Bearer token 鉴权（email/mobile/password
+# 可全部留空）。获取方式（一次性）：
+#   1. 浏览器（建议与本服务同网络出口）登录 https://chat.deepseek.com；
+#   2. DevTools → Network 里找任意 /api/v0/* 请求，复制请求头
+#      `Authorization: Bearer <token>` 中的 <token> 填到下方 token；
+#   3. （可选但推荐）同时复制该请求的完整 `Cookie` 头填到 cookies
+#      （含 ds_session_id / smidV2 / HWWAFSESID 等）。
+#
+# 注意：
+#   - token 与 cookies 必须来自**同一浏览器会话**；
+#   - cookies 会作为种子灌入该账号独立的 Cookie jar：此后每个响应的
+#     `Set-Cookie`（WAF 会话续期等）由 jar 自动捕获并按域回传，与浏览器
+#     行为一致 —— WAF Cookie 过期后无需手动更新配置；completion 遇到
+#     WAF challenge 时会自动访问站点根重新领取 Cookie 并重试一次；
+#   - token 长期有效但存在轮换机制（check_device 的 rotate 指令），失效或被
+#     上游判定异常时需重新登录并更新；
+#   - HWWAFSESID 等 WAF Cookie 有效期较短，过期后请求可能被 WAF 拦截，
+#     届时重新复制一份 Cookie 即可；
+#   - 多账号请各自用独立浏览器配置登录后分别填写。
+#
+# [[ds_core.accounts]]
+# token = "place-your-browser-token-here"
+# cookies = "ds_session_id=…; smidV2=…; HWWAFSESID=…（从浏览器 DevTools 复制）"
+# remark = "我的主号"          # 账号备注名（可选，展示用）
+#
+# ── 浏览器采集登录（管理面板按钮，推荐）──────────────────────────────
+#
+# 管理面板「浏览器采集登录」按钮可以替代上面的手动复制：点击后程序拉起
+# 本机 Chrome（独立持久化 profile），你在窗口里正常完成登录（MFA/验证码
+# 由人操作），程序旁路监听登录后的 API 请求，自动采集 token / cookies /
+# X-Device-Id / User-Agent 并写回账号配置、热加入账号池。
+#
+# - 同一浏览器（X-Device-Id 相同）视为同一账号：再次采集会**更新**其
+#   token/cookies 而不是新增（token 过期后点一下按钮即可续期）；
+# - 以下两个字段由采集自动写回，通常无需手填：
+# x_device_id = "5512ebd8-9df7-4418-9534-578bd772f5e3"   # 浏览器的 X-Device-Id
+# user_agent = "Mozilla/5.0 … Chrome/101.0.4951.54 …"    # 浏览器的 UA
+# - Chrome 路径默认自动探测（macOS / Linux / Windows 标准路径），
+#   可用环境变量 DS_CHROME_PATH 覆盖。
+
+# 设备指纹 ID（**凭据模式必填**）：缺失会被登录风控直接拒绝
+# （客户端错误: Business error: code=11, msg=RISK_DEVICE_DETECTED）；
+# 手动令牌模式无需填写。
 #
 # 获取方式：用 Chrome 打开 https://chat.deepseek.com/sign_in 并登录一次，
 # 在开发者工具 → Network 中查看 POST /api/v0/users/login 请求体里的 device_id 值；
@@ -56,6 +105,9 @@ port = 22217
 # 客户端靠拢（这才是最可能"伪装通过"的策略）。可用下方 emulation 切回原生 App 档。
 #
 # User-Agent（默认桌面 Chrome；Windows 平台与下方 client hints 自洽）
+#
+# 手动令牌模式建议把 UA 改成**与登录浏览器一致**（token/Cookie 与指纹同源更自洽；
+# `sec-ch-ua` 的版本号会从 UA 自动派生，无需另外配置）。
 # user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 # X-Client-Version（应用版本号；官方 Web 客户端同为 2.5.0）
 # client_version = "2.5.0"

@@ -50,3 +50,6 @@ lerna-debug.log*
 # 呃
 .claude
 .deepseek
+
+# 浏览器采集登录的持久化 profile（含登录态，凭据敏感）
+capture-profile/

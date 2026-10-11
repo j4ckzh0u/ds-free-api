@@ -91,6 +91,7 @@ src/
 ├── server/              # HTTP server submodules
 │   ├── admin.rs         # Admin panel route handlers
 │   ├── auth.rs          # JWT sign/verify, password setup/login, rate limiter
+│   ├── capture.rs       # 浏览器采集登录：CDP 驱动本机 Chrome 旁路采集 token/cookies
 │   ├── idempotency.rs   # Idempotency-Key cache (bounded + 24h TTL) + SSE recorder
 │   ├── error.rs         # ServerError: OpenAI + Anthropic error envelopes
 │   ├── handlers.rs      # Business route handlers (OpenAI + Responses + Anthropic)
@@ -281,6 +282,19 @@ Every module has one job. Cross-module boundaries are strict:
 
 `AccountPool::init()` spins up accounts concurrently (capped at 13 via `tokio::sync::Semaphore`).
 Each account runs `try_init_account()`:
+0. **手动令牌模式**：账号配置里 `token` 非空时**跳过登录**（email/mobile/password 可省略），
+   仅做一次 `check_device` 对齐真实客户端启动序列。2026-10-10 抓包实测上游登录已需
+   加密请求体 + MFA 邮箱验证码 + 数美验证码，自动登录不可行（`biz_code=14` 终止性错误）；
+   凭据来自管理面板「浏览器采集登录」或手动复制。账号级 `x_device_id` / `user_agent`
+   覆盖与 Cookie 一起构成与采集浏览器同源的设备身份。
+   - **Cookie jar**：每个账号独立连接池 + 独立 jar（`DsClient::account_view`），
+     配置的 `cookies` 作为种子，此后 `Set-Cookie` 自动捕获续期（WAF 会话不再需要
+     手动更新）；completion 遇 WAF challenge 自动 GET 站点根重领 Cookie 并重试一次；
+   - **令牌轮换持久化**：`check_device` 的 rotate 被采纳时发 `TokenRotation` 事件
+     （`DsCore::take_rotation_events`，仅手动令牌模式），server 启动时消费并写回
+     config.toml —— 不消费则轮换只存在于内存，重启后拿旧 token；
+   - token 失效（`code=40003`）走既有恢复链路（Error → 60s 重试 → 3 次后 Invalid），
+     重试即 check_device，可能顺带完成轮换。
 1. `login` — obtain Bearer token (payload carries the account's `device_id`; **omitting it
    fails with `RISK_DEVICE_DETECTED`, biz_code 11** — verified empirically, see `docs/development.md`)
 2. `create_session` — create a temporary chat session
@@ -714,6 +728,7 @@ Follow `docs/code-style.md`:
 | DeepSeek API reference | `ds_core/raw-api-reference.md` | 端点、信封格式、SSE 增量协议、PoW 算法 |
 | Development guide | `docs/development.md` | 环境配置、首次启动、Release 构建 |
 | Admin panel routes | `src/server/admin.rs` | Setup/login/config/status/stats/models/logs handlers |
+| 浏览器采集登录 | `src/server/capture.rs` | 管理面板按钮 → CDP 驱动 headful Chrome（持久化 profile）→ 人工登录 → 旁路采集 token/cookies/X-Device-Id/UA → 写回 config + 池热同步。同浏览器（X-Device-Id 相同）= 更新同一账号。**事件必须用 Page 级监听**（handler 不向 browser 级广播带 session_id 的页面事件）；先订阅后导航（避免漏掉已登录 profile 秒发的鉴权请求）。端到端 mock 测试 `capture_pipeline_works_with_mock_page`（#[ignore]，本机 Chrome：`cargo test --lib capture -- --ignored`） |
 | JWT auth + password | `src/server/auth.rs` | `setup_admin()`/`login_admin()`, JWT sign/verify, login rate limiter |
 | Store manager | `src/server/store.rs` | API key validation, stats persistence, delegates admin/keys to `Config::save()` |
 | Request stats | `src/server/stats.rs` | `RequestStats`, `StatsHandle`, background flush to `stats.json` |
