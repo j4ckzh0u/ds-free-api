@@ -189,19 +189,59 @@ pub struct ApiKeyEntry {
 }
 
 /// 单个账号配置
+///
+/// 凭据模式需 email/mobile + password；**手动令牌模式（token 非空）下
+/// 这四个凭据字段全部可省略**。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Account {
-    /// 邮箱（与 mobile 二选一）
+    /// 邮箱（与 mobile 二选一；手动令牌模式可省略）
+    #[serde(default)]
     pub email: String,
-    /// 手机号（与 email 二选一）
+    /// 手机号（与 email 二选一；手动令牌模式可省略）
+    #[serde(default)]
     pub mobile: String,
     /// 区号（与 mobile 配合使用，如 "+86"）
+    #[serde(default)]
     pub area_code: String,
-    /// 密码
+    /// 密码（手动令牌模式可省略）
+    #[serde(default)]
     pub password: String,
     /// 浏览器设备指纹 ID（可选，规避登录风控用，见 config.example.toml 说明）
     #[serde(default)]
     pub device_id: String,
+    /// 手动令牌模式的 Bearer token（非空时跳过登录直接使用）
+    ///
+    /// 2026-10 起上游登录需加密请求体 + MFA 邮箱验证码 + 数美验证码，
+    /// 自动登录不再可行：在浏览器登录 chat.deepseek.com 后，从任意 API 请求的
+    /// `Authorization: Bearer <token>` 头复制 token 填到这里（email/mobile 可留空）。
+    #[serde(default)]
+    pub token: String,
+    /// 手动令牌模式配套的 Cookie 串（原样作为 `Cookie` 请求头发送，可选）
+    ///
+    /// 从浏览器 DevTools 的请求头复制，例如
+    /// `ds_session_id=…; smidV2=…; HWWAFSESID=…`。与 token 必须来自同一浏览器会话。
+    #[serde(default)]
+    pub cookies: String,
+    /// 账号备注名（管理面板/日志展示用，与登录无关）
+    #[serde(default)]
+    pub remark: String,
+    /// 显式 X-Device-Id 覆盖（浏览器采集登录自动填入，保持 token ↔ 设备身份同源）
+    #[serde(default)]
+    pub x_device_id: String,
+    /// 该账号独立的 User-Agent 覆盖（浏览器采集登录自动填入）
+    #[serde(default)]
+    pub user_agent: String,
+}
+
+impl Account {
+    /// 账号展示标识：备注 → email → mobile → `token-<前8位>`
+    ///
+    /// 与 ds_core 账号池内的 `display_id` 同口径，用于令牌轮换事件回写时
+    /// 在配置里定位账号。
+    #[must_use]
+    pub fn display_label(&self) -> String {
+        ds_core::account_display_label(&self.remark, &self.email, &self.mobile, &self.token)
+    }
 }
 
 /// 代理配置
@@ -407,14 +447,18 @@ impl Config {
         Ok(config)
     }
 
-    /// 按 email（优先）或 mobile 去重，保留首次出现的账号
+    /// 按 email（优先）→ mobile → token 去重，保留首次出现的账号
+    ///
+    /// 手动令牌账号（email/mobile 均空）按 token 去重，避免多个令牌账号被误合并。
     fn dedup_accounts(&mut self) {
         let mut seen = std::collections::HashSet::new();
         self.ds_core.accounts.retain(|a| {
-            let key = if a.email.is_empty() {
+            let key = if !a.email.is_empty() {
+                a.email.clone()
+            } else if !a.mobile.is_empty() {
                 a.mobile.clone()
             } else {
-                a.email.clone()
+                a.token.clone()
             };
             seen.insert(key)
         });

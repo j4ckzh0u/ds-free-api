@@ -185,6 +185,12 @@ export interface AccountEntry {
   area_code: string;
   password: string;
   device_id?: string;
+  /** 手动令牌模式：浏览器登录后的 Bearer token（非空时跳过登录） */
+  token?: string;
+  /** 手动令牌模式：配套 Cookie 串（与 token 同一浏览器会话） */
+  cookies?: string;
+  /** 账号备注名（展示用，与登录无关） */
+  remark?: string;
 }
 
 export interface DsCoreConfig {
@@ -352,6 +358,31 @@ export function normalizeConfig(raw: any): FullConfig {
     },
     api_keys: Array.isArray(raw.api_keys) ? raw.api_keys : [],
   };
+}
+
+// ── 浏览器采集登录 ─────────────────────────────────────────────────────────
+
+export interface CaptureStatus {
+  phase: 'idle' | 'running' | 'success' | 'failed';
+  /** 展示给用户的消息（进度 / 失败原因） */
+  message: string;
+  /** 成功时新增/更新的账号标识 */
+  account_label?: string;
+  /** 本次运行观测到的 /api/v0/* 请求数 */
+  seen_api_requests: number;
+}
+
+/** 启动浏览器采集登录（同一时刻只允许一个采集任务） */
+export async function apiCaptureStart(remark?: string): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>('/admin/api/accounts/capture', {
+    method: 'POST',
+    body: JSON.stringify({ remark: remark ?? '' }),
+  });
+}
+
+/** 轮询采集状态 */
+export async function apiCaptureStatus(): Promise<CaptureStatus> {
+  return apiFetch<CaptureStatus>('/admin/api/accounts/capture');
 }
 
 export async function apiFetchConfig(): Promise<FullConfig> {

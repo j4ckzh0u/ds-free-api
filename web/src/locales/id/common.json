@@ -94,6 +94,12 @@
       "password": "Password",
       "deviceId": "ID Perangkat",
       "deviceIdPlaceholder": "ID sidik jari perangkat browser",
+      "remark": "Keterangan",
+      "remarkPlaceholder": "Keterangan akun (opsional)",
+      "token": "Token (manual)",
+      "tokenPlaceholder": "Token Bearer dari login browser; melewati login jika diisi",
+      "cookies": "Cookie",
+      "cookiesPlaceholder": "ds_session_id=…; smidV2=… (sesi browser yang sama dengan token)",
       "add": "Tambah Akun",
       "countLabel": "{{count}} Akun",
       "accountNumber": "Akun #{{num}}",
@@ -162,6 +168,13 @@
     "proxy": {
       "url": "URL Proxy (kosongkan untuk menonaktifkan)",
       "placeholder": "http://127.0.0.1:7890"
+    },
+    "capture": {
+      "button": "Ambil via Browser",
+      "remarkPlaceholder": "Keterangan (opsional)",
+      "running": "Browser terbuka — masuk ke chat.deepseek.com di jendela tersebut ({{count}} permintaan API terlihat)",
+      "success": "Berhasil diambil: {{label}}",
+      "failed": "Gagal mengambil: {{message}}"
     }
   },
   "settings": {

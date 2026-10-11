@@ -172,6 +172,8 @@ pub(crate) struct AppState {
     pub(crate) config_path: PathBuf,
     /// `Idempotency-Key` 缓存（进程内，有界 + TTL）
     pub(crate) idempotency: Arc<IdempotencyStore>,
+    /// 浏览器采集登录管理器（全局单槽）
+    pub(crate) capture: Arc<crate::server::capture::CaptureManager>,
 }
 struct RequestRecord<'a> {
     request_id: &'a str,

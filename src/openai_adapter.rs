@@ -94,6 +94,11 @@ impl OpenAIAdapter {
                 area_code: a.area_code.clone(),
                 password: a.password.clone(),
                 device_id: a.device_id.clone(),
+                token: a.token.clone(),
+                cookies: a.cookies.clone(),
+                remark: a.remark.clone(),
+                x_device_id: a.x_device_id.clone(),
+                user_agent: a.user_agent.clone(),
             })
             .collect();
         let ds_core = Arc::new(DsCore::new(&core_cfg, accounts).await?);
@@ -395,8 +400,18 @@ impl OpenAIAdapter {
             area_code: creds.area_code.clone(),
             password: creds.password.clone(),
             device_id: creds.device_id.clone(),
+            token: creds.token.clone(),
+            cookies: creds.cookies.clone(),
+            remark: creds.remark.clone(),
+            x_device_id: creds.x_device_id.clone(),
+            user_agent: creds.user_agent.clone(),
         };
         self.ds_core.add_account(&ac).await
+    }
+
+    /// 取走服务端令牌轮换事件的接收端（供 server 启动时消费、持久化）
+    pub fn take_rotation_events(&self) -> Option<ds_core::TokenRotationReceiver> {
+        self.ds_core.take_rotation_events()
     }
 
     /// 动态移除账号
@@ -417,28 +432,27 @@ impl OpenAIAdapter {
 
 impl OpenAIAdapter {
     /// 批量同步账号：对比当前账号池与目标配置，增删差异账号
+    ///
+    /// 账号标识统一用 `ds_core::account_display_label`（备注 → email → mobile →
+    /// `token-<前8位>`）：手动令牌账号 email/mobile 均空，不能按 email/mobile
+    /// 识别（会被折叠成 ""，既加不进池也删不掉）。池内 ID 由 `account_ids()`
+    /// 给出，两侧口径一致。
     pub(crate) async fn sync_accounts(&self, new_accounts: &[crate::config::Account]) {
-        let old_statuses = self.account_statuses();
-        let old_ids: Vec<String> = old_statuses
-            .iter()
-            .map(|a| {
-                if a.email.is_empty() {
-                    a.mobile.clone()
-                } else {
-                    a.email.clone()
-                }
-            })
-            .collect();
+        let old_ids = self.ds_core.account_ids();
+        let old_ids: std::collections::HashSet<String> = old_ids.into_iter().collect();
 
         let mut _added = 0usize;
         let mut _failed = 0usize;
+        let mut new_ids: Vec<String> = Vec::with_capacity(new_accounts.len());
         for acct in new_accounts {
-            let id = if acct.email.is_empty() {
-                &acct.mobile
-            } else {
-                &acct.email
-            };
-            if !old_ids.contains(id) {
+            // 与池内 display_id 同口径（含备注优先），否则带备注账号会被误判
+            let id = ds_core::account_display_label(
+                &acct.remark,
+                &acct.email,
+                &acct.mobile,
+                &acct.token,
+            );
+            if !old_ids.contains(&id) {
                 match self.add_account(acct).await {
                     Ok(_) => _added += 1,
                     Err(e) => {
@@ -447,21 +461,12 @@ impl OpenAIAdapter {
                     }
                 }
             }
+            new_ids.push(id);
         }
 
         let mut _removed = 0usize;
-        let new_ids: Vec<&str> = new_accounts
-            .iter()
-            .map(|a| {
-                if a.email.is_empty() {
-                    a.mobile.as_str()
-                } else {
-                    a.email.as_str()
-                }
-            })
-            .collect();
         for old_id in &old_ids {
-            if !new_ids.contains(&old_id.as_str()) && !old_id.is_empty() {
+            if !new_ids.contains(old_id) && old_id != "unnamed" {
                 match self.remove_account(old_id) {
                     Ok(_) => _removed += 1,
                     Err(e) => {

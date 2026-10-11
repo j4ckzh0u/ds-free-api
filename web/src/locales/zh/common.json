@@ -94,6 +94,12 @@
       "password": "密码",
       "deviceId": "设备 ID",
       "deviceIdPlaceholder": "浏览器设备指纹 ID",
+      "remark": "备注",
+      "remarkPlaceholder": "账号备注名（可选）",
+      "token": "Token（手动令牌）",
+      "tokenPlaceholder": "浏览器登录后的 Bearer token，填写后跳过登录",
+      "cookies": "Cookie",
+      "cookiesPlaceholder": "ds_session_id=…; smidV2=…（与 token 同一浏览器会话）",
       "add": "添加账号",
       "countLabel": "{{count}} 个账号",
       "accountNumber": "账号 #{{num}}",
@@ -162,6 +168,13 @@
     "proxy": {
       "url": "代理 URL（留空禁用）",
       "placeholder": "http://127.0.0.1:7890"
+    },
+    "capture": {
+      "button": "浏览器采集登录",
+      "remarkPlaceholder": "备注名（可选）",
+      "running": "浏览器已打开，请在窗口内登录 chat.deepseek.com（已观测到 {{count}} 个 API 请求）",
+      "success": "采集成功：{{label}}",
+      "failed": "采集失败：{{message}}"
     }
   },
   "settings": {

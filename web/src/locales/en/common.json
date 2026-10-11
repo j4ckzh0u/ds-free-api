@@ -94,6 +94,12 @@
       "password": "Password",
       "deviceId": "Device ID",
       "deviceIdPlaceholder": "Browser device fingerprint ID",
+      "remark": "Remark",
+      "remarkPlaceholder": "Account remark (optional)",
+      "token": "Token (manual)",
+      "tokenPlaceholder": "Bearer token from browser login; skips login when set",
+      "cookies": "Cookies",
+      "cookiesPlaceholder": "ds_session_id=…; smidV2=… (same browser session as token)",
       "add": "Add Account",
       "countLabel": "{{count}} Accounts",
       "accountNumber": "Account #{{num}}",
@@ -162,6 +168,13 @@
     "proxy": {
       "url": "Proxy URL (leave empty to disable)",
       "placeholder": "http://127.0.0.1:7890"
+    },
+    "capture": {
+      "button": "Capture via Browser",
+      "remarkPlaceholder": "Remark (optional)",
+      "running": "Browser opened — sign in to chat.deepseek.com in the window ({{count}} API requests seen)",
+      "success": "Captured: {{label}}",
+      "failed": "Capture failed: {{message}}"
     }
   },
   "settings": {

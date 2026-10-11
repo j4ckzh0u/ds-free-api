@@ -1,6 +1,14 @@
 import { useEffect, useState, useRef } from 'react';
 import { useOutletContext } from 'react-router-dom';
-import { apiFetchConfig, apiSaveConfig, localizeAuthError, type FullConfig } from '@/lib/api';
+import {
+  apiCaptureStart,
+  apiCaptureStatus,
+  apiFetchConfig,
+  apiSaveConfig,
+  localizeAuthError,
+  type CaptureStatus,
+  type FullConfig,
+} from '@/lib/api';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -20,6 +28,7 @@ import {
   CheckCircle2,
   AlertCircle,
   Sliders,
+  Globe,
 } from 'lucide-react';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useTranslation } from 'react-i18next';
@@ -39,7 +48,14 @@ export function ConfigPage() {
   const [message, setMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [revealedKeys, setRevealedKeys] = useState<Record<number, boolean>>({});
   const [revealedPasswords, setRevealedPasswords] = useState<Record<number, boolean>>({});
+  const [revealedTokens, setRevealedTokens] = useState<Record<number, boolean>>({});
   const [copiedKeyIdx, setCopiedKeyIdx] = useState<number | null>(null);
+  // 浏览器采集登录
+  const [captureRemark, setCaptureRemark] = useState('');
+  const [captureStatus, setCaptureStatus] = useState<CaptureStatus | null>(null);
+  const captureTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // 轮询回调里判断「有无未保存修改」用的镜像（避免在 setState updater 里做副作用）
+  const configSnapshotRef = useRef<{ current: string; initial: string }>({ current: '', initial: '' });
 
   useEffect(() => {
     apiFetchConfig()
@@ -49,6 +65,61 @@ export function ConfigPage() {
       })
       .catch(() => setMessage({ type: 'err', text: t('config.loadFailed') }));
   }, [t]);
+
+  useEffect(() => {
+    configSnapshotRef.current = {
+      current: config ? JSON.stringify(config) : '',
+      initial: initialConfig,
+    };
+  }, [config, initialConfig]);
+
+  // 启动浏览器采集登录，并每 2 秒轮询状态；成功且无未保存修改时刷新账号列表
+  const startCapture = async () => {
+    if (captureStatus?.phase === 'running') return;
+    try {
+      await apiCaptureStart(captureRemark.trim() || undefined);
+      setCaptureStatus({ phase: 'running', message: '', seen_api_requests: 0 });
+    } catch (e) {
+      setCaptureStatus({
+        phase: 'failed',
+        message: e instanceof Error ? e.message : String(e),
+        seen_api_requests: 0,
+      });
+      return;
+    }
+    if (captureTimerRef.current) clearInterval(captureTimerRef.current);
+    captureTimerRef.current = setInterval(async () => {
+      try {
+        const st = await apiCaptureStatus();
+        setCaptureStatus(st);
+        if (st.phase === 'idle' || st.phase === 'running') return;
+        clearInterval(captureTimerRef.current!);
+        captureTimerRef.current = null;
+        if (st.phase === 'success') {
+          setCaptureRemark('');
+          // 无未保存修改时才自动刷新；有修改则保留本地编辑，由用户手动刷新
+          const snap = configSnapshotRef.current;
+          if (snap.current && snap.current === snap.initial) {
+            apiFetchConfig()
+              .then((cfg) => {
+                setConfig(cfg);
+                setInitialConfig(JSON.stringify(cfg));
+              })
+              .catch(() => {});
+          }
+        }
+      } catch {
+        // 轮询失败忽略，下个周期重试
+      }
+    }, 2000);
+  };
+
+  useEffect(
+    () => () => {
+      if (captureTimerRef.current) clearInterval(captureTimerRef.current);
+    },
+    []
+  );
 
   const { isSidebarCollapsed } = useOutletContext<{ isSidebarCollapsed?: boolean }>() || {};
   const [isHeaderActionVisible, setIsHeaderActionVisible] = useState(true);
@@ -363,6 +434,69 @@ export function ConfigPage() {
                       />
                     </div>
 
+                    {/* 手动令牌模式：非空时跳过登录（换行到第二行网格） */}
+                    <div className="sm:col-span-3">
+                      <label htmlFor={`acc-token-${i}`} className="text-[11px] font-medium text-muted-foreground block mb-1">
+                        {t('config.accounts.token')}
+                      </label>
+                      <div className="relative">
+                        <Input
+                          id={`acc-token-${i}`}
+                          type={revealedTokens[i] ? 'text' : 'password'}
+                          placeholder={t('config.accounts.tokenPlaceholder')}
+                          value={a.token ?? ''}
+                          onChange={(e) => {
+                            const next = [...config.ds_core.accounts];
+                            next[i] = { ...next[i], token: e.target.value };
+                            update(['ds_core', 'accounts'], next);
+                          }}
+                          className="text-xs font-mono pr-8"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setRevealedTokens((prev) => ({ ...prev, [i]: !prev[i] }))}
+                          className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                          aria-label="Toggle token visibility"
+                        >
+                          {revealedTokens[i] ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="sm:col-span-3">
+                      <label htmlFor={`acc-cookies-${i}`} className="text-[11px] font-medium text-muted-foreground block mb-1">
+                        {t('config.accounts.cookies')}
+                      </label>
+                      <Input
+                        id={`acc-cookies-${i}`}
+                        placeholder={t('config.accounts.cookiesPlaceholder')}
+                        value={a.cookies ?? ''}
+                        onChange={(e) => {
+                          const next = [...config.ds_core.accounts];
+                          next[i] = { ...next[i], cookies: e.target.value };
+                          update(['ds_core', 'accounts'], next);
+                        }}
+                        className="text-xs font-mono"
+                      />
+                    </div>
+
+                    <div className="sm:col-span-3">
+                      <label htmlFor={`acc-remark-${i}`} className="text-[11px] font-medium text-muted-foreground block mb-1">
+                        {t('config.accounts.remark')}
+                      </label>
+                      <Input
+                        id={`acc-remark-${i}`}
+                        placeholder={t('config.accounts.remarkPlaceholder')}
+                        value={a.remark ?? ''}
+                        onChange={(e) => {
+                          const next = [...config.ds_core.accounts];
+                          next[i] = { ...next[i], remark: e.target.value };
+                          update(['ds_core', 'accounts'], next);
+                        }}
+                        className="text-xs"
+                      />
+                    </div>
+
                     {/* Desktop Delete Button */}
                     <div className="hidden sm:flex sm:col-span-1 justify-end">
                       <Button
@@ -386,13 +520,60 @@ export function ConfigPage() {
             </div>
           )}
 
+          {/* 浏览器采集登录：打开真实 Chrome 人工登录，自动采集 token/cookies */}
+          <div className="flex flex-col sm:flex-row gap-2 sm:items-center pt-1">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={startCapture}
+              disabled={captureStatus?.phase === 'running'}
+              className="gap-1.5 text-xs shrink-0"
+            >
+              <Globe className="h-3.5 w-3.5" />
+              <span>{t('config.capture.button')}</span>
+            </Button>
+            <Input
+              placeholder={t('config.capture.remarkPlaceholder')}
+              value={captureRemark}
+              onChange={(e) => setCaptureRemark(e.target.value)}
+              disabled={captureStatus?.phase === 'running'}
+              className="h-8 text-xs flex-1"
+            />
+          </div>
+          {captureStatus && captureStatus.phase !== 'idle' && (
+            <div
+              className={cn(
+                'flex items-start gap-1.5 text-xs rounded-lg px-2.5 py-2 border',
+                captureStatus.phase === 'running' && 'text-muted-foreground bg-muted/20',
+                captureStatus.phase === 'success' && 'text-green-600 bg-green-500/10 border-green-500/30',
+                captureStatus.phase === 'failed' && 'text-destructive bg-destructive/10 border-destructive/30'
+              )}
+            >
+              {captureStatus.phase === 'success' ? (
+                <CheckCircle2 className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+              ) : captureStatus.phase === 'failed' ? (
+                <AlertCircle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+              ) : (
+                <Globe className="h-3.5 w-3.5 mt-0.5 shrink-0 animate-pulse" />
+              )}
+              <span className="min-w-0 break-words">
+                {captureStatus.phase === 'running' &&
+                  `${t('config.capture.running')} (${captureStatus.seen_api_requests})`}
+                {captureStatus.phase === 'success' &&
+                  t('config.capture.success', { label: captureStatus.account_label ?? '' })}
+                {captureStatus.phase === 'failed' &&
+                  t('config.capture.failed', { message: captureStatus.message })}
+              </span>
+            </div>
+          )}
+
           <Button
             variant="outline"
             size="sm"
             onClick={() =>
               update(['ds_core', 'accounts'], [
                 ...config.ds_core.accounts,
-                { email: '', mobile: '', area_code: '', password: '', device_id: '' },
+                { email: '', mobile: '', area_code: '', password: '', device_id: '', token: '', cookies: '' },
               ])
             }
             className="gap-1.5 text-xs mt-2"

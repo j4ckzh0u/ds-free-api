@@ -20,7 +20,8 @@ import sys
 import time
 from datetime import datetime
 
-import httpx
+# pyproject 已从 httpx 更名为 httpx2（API 同名），此处兼容别名
+import httpx2 as httpx
 
 from config import load_config
 

@@ -136,6 +136,16 @@ pub struct AccountView {
     pub area_code: String,
     pub password: String,
     pub device_id: String,
+    /// 手动令牌模式的 Bearer token（面板以密码框遮蔽展示）
+    pub token: String,
+    /// 手动令牌模式配套的 Cookie 串
+    pub cookies: String,
+    /// 账号备注名
+    pub remark: String,
+    /// 显式 X-Device-Id 覆盖（浏览器采集自动填入，面板不展示）
+    pub x_device_id: String,
+    /// 该账号独立 User-Agent 覆盖（浏览器采集自动填入，面板不展示）
+    pub user_agent: String,
 }
 
 // ── 脱敏 ─────────────────────────────────────────────────────────────────
@@ -158,6 +168,11 @@ fn mask_config(config: &Config) -> AdminConfigResponse {
                     area_code: a.area_code.clone(),
                     password: a.password.clone(),
                     device_id: a.device_id.clone(),
+                    token: a.token.clone(),
+                    cookies: a.cookies.clone(),
+                    remark: a.remark.clone(),
+                    x_device_id: a.x_device_id.clone(),
+                    user_agent: a.user_agent.clone(),
                 })
                 .collect(),
             api_base: config.ds_core.api_base.clone(),
@@ -387,25 +402,56 @@ pub(crate) async fn admin_put_config(
     // API keys match by `id` (stable identifier), falling back to description for old-format migration.
     {
         let current = state.config.read().await;
+        // 凭据账号按 email+mobile 匹配；手动令牌账号（email/mobile 均空）无法按
+        // 标识区分，按其在「空标识账号子序列」中的位置对应（面板按原顺序回传数组）
+        let token_only_existing: Vec<&crate::config::Account> = current
+            .ds_core
+            .accounts
+            .iter()
+            .filter(|e| e.email.is_empty() && e.mobile.is_empty())
+            .collect();
+        let mut token_only_seen = 0usize;
         for a in &mut new_config.ds_core.accounts {
-            if (a.password.is_empty() || a.password == "***")
-                && let Some(existing) = current
+            let existing = if a.email.is_empty() && a.mobile.is_empty() {
+                let found = token_only_existing.get(token_only_seen).copied();
+                token_only_seen += 1;
+                found
+            } else {
+                current
                     .ds_core
                     .accounts
                     .iter()
                     .find(|e| e.email == a.email && e.mobile == a.mobile)
-            {
+            };
+            let Some(existing) = existing else {
+                continue;
+            };
+            // empty/"***" 密码保留现有值
+            if a.password.is_empty() || a.password == "***" {
                 a.password.clone_from(&existing.password);
             }
             // device_id 为空时保留现有值（面板旧前端不发送该字段）
-            if a.device_id.is_empty()
-                && let Some(existing) = current
-                    .ds_core
-                    .accounts
-                    .iter()
-                    .find(|e| e.email == a.email && e.mobile == a.mobile)
-            {
+            if a.device_id.is_empty() {
                 a.device_id.clone_from(&existing.device_id);
+            }
+            // 手动令牌：空/"***" 时保留现有值（与 password 同一套脱敏约定，
+            // 防止面板全量替换把 config.toml 里手填的 token/cookies 抹掉）
+            if a.token.is_empty() || a.token == "***" {
+                a.token.clone_from(&existing.token);
+            }
+            if a.cookies.is_empty() || a.cookies == "***" {
+                a.cookies.clone_from(&existing.cookies);
+            }
+            // 备注空 = 保留现有（清空备注请填一个空格）
+            if a.remark.is_empty() {
+                a.remark.clone_from(&existing.remark);
+            }
+            // 采集写回的设备身份/UA 覆盖：面板不展示，空值一律保留现有
+            if a.x_device_id.is_empty() || a.x_device_id == "***" {
+                a.x_device_id.clone_from(&existing.x_device_id);
+            }
+            if a.user_agent.is_empty() || a.user_agent == "***" {
+                a.user_agent.clone_from(&existing.user_agent);
             }
         }
         // Admin 配置：空的 password_hash/jwt_secret 保留现有值（前端不返回这些字段）
@@ -500,6 +546,51 @@ pub(crate) async fn admin_runtime_logs(Query(query): Query<RuntimeLogsQuery>) ->
         "limit": query.limit,
         "logs": logs,
     }))
+}
+
+// ── 浏览器采集登录 ────────────────────────────────────────────────────────
+
+/// POST /admin/api/accounts/capture — 启动浏览器采集（body 可带备注名）
+pub(crate) async fn admin_capture_start(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Response {
+    #[derive(Deserialize)]
+    struct CaptureRequest {
+        #[serde(default)]
+        remark: String,
+    }
+    let req: CaptureRequest = serde_json::from_slice(&body).unwrap_or(CaptureRequest {
+        remark: String::new(),
+    });
+
+    // 浏览器 profile 与 config.toml 同目录（持久化，保留登录态与数美指纹）
+    let profile_dir = state
+        .config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(
+            || std::path::PathBuf::from("capture-profile"),
+            |p| p.join("capture-profile"),
+        );
+    let ctx = crate::server::capture::CaptureContext {
+        config: state.config.clone(),
+        config_path: state.config_path.clone(),
+        adapter: state.adapter.clone(),
+        profile_dir,
+    };
+    match crate::server::capture::start_capture(&state.capture, ctx, req.remark) {
+        Ok(()) => json_response(&serde_json::json!({"ok": true})),
+        Err(status) => error_response(
+            StatusCode::CONFLICT,
+            &format!("已有采集任务进行中（{}）", status.message),
+        ),
+    }
+}
+
+/// GET /admin/api/accounts/capture — 轮询采集状态
+pub(crate) async fn admin_capture_status(State(state): State<AppState>) -> Response {
+    json_response(&state.capture.status())
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────

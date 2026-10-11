@@ -4,6 +4,7 @@
 
 mod admin;
 mod auth;
+mod capture;
 mod error;
 mod handlers;
 mod idempotency;
@@ -12,7 +13,7 @@ mod stats;
 mod store;
 mod stream;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
@@ -60,6 +61,29 @@ pub async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     let responses_store_ttl_secs = config.ds_core.responses_store_ttl_secs;
     let adapter = Arc::new(OpenAIAdapter::new(&config).await?);
     let config = Arc::new(tokio::sync::RwLock::new(config));
+
+    // 服务端令牌轮换（check_device rotate）→ 把新 token 持久化回 config.toml。
+    // 不消费则轮换只存在于内存，重启后会拿旧 token。
+    if let Some(mut rotation_rx) = adapter.take_rotation_events() {
+        let config = Arc::clone(&config);
+        let config_path = config_path.clone();
+        tokio::spawn(async move {
+            while let Some(rotation) = rotation_rx.recv().await {
+                match persist_token_rotation(&config, &config_path, &rotation).await {
+                    Ok(()) => log::info!(
+                        target: "http::server",
+                        "账号 {} 的轮换 token 已写入 config.toml",
+                        rotation.account
+                    ),
+                    Err(e) => log::error!(
+                        target: "http::server",
+                        "账号 {} 的轮换 token 写回 config 失败: {e}",
+                        rotation.account
+                    ),
+                }
+            }
+        });
+    }
     let anthropic_compat = Arc::new(AnthropicCompat::new(Arc::clone(&adapter)));
     let responses_adapter = Arc::new(ResponsesAdapter::new(
         Arc::clone(&adapter),
@@ -84,6 +108,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         store: store.clone(),
         login_limiter: login_limiter.clone(),
         idempotency: Arc::new(idempotency::IdempotencyStore::new()),
+        capture: Arc::new(capture::CaptureManager::new()),
     };
     let router = build_router(state.clone(), &cors_origins);
 
@@ -160,6 +185,15 @@ fn build_router(state: AppState, cors_origins: &[String]) -> Router {
         .route("/admin/api/config", get(admin::admin_config))
         // Config
         .route("/admin/api/config", put(admin::admin_put_config))
+        // 浏览器采集登录
+        .route(
+            "/admin/api/accounts/capture",
+            post(admin::admin_capture_start),
+        )
+        .route(
+            "/admin/api/accounts/capture",
+            get(admin::admin_capture_status),
+        )
         // Request logs
         .route("/admin/api/logs", get(admin::admin_logs))
         // Runtime logs
@@ -431,6 +465,26 @@ async fn shutdown_signal() {
 // HTTP 层测试：鉴权中间件、错误信封、路由挂载
 // ============================================================================
 
+/// 把一次服务端令牌轮换写回 config.toml：按展示标识定位账号 → 更新 token →
+/// 原子保存。找不到账号（配置被改/已删除）返回 Err，由调用方记日志并跳过。
+async fn persist_token_rotation(
+    config: &Arc<tokio::sync::RwLock<Config>>,
+    config_path: &Path,
+    rotation: &ds_core::TokenRotation,
+) -> Result<(), String> {
+    let mut cfg = config.write().await;
+    let Some(account) = cfg
+        .ds_core
+        .accounts
+        .iter_mut()
+        .find(|a| a.display_label() == rotation.account)
+    else {
+        return Err(format!("未找到对应账号 {}", rotation.account));
+    };
+    account.token.clone_from(&rotation.new_token);
+    cfg.save(config_path).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use axum::Router;
@@ -457,6 +511,69 @@ description = "test"
 "#
         );
         toml::from_str(&toml_str).expect("test config must parse")
+    }
+
+    /// 令牌轮换持久化：按展示标识定位账号 → 更新 token → 落盘
+    #[tokio::test]
+    async fn persist_token_rotation_updates_config_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ds-rotate-test-{:?}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let toml_str = r#"
+[server]
+host = "127.0.0.1"
+port = 22217
+
+[ds_core]
+
+[[ds_core.accounts]]
+token = "OldToken0001Placeholder"
+remark = "主号"
+
+[[ds_core.accounts]]
+email = "a@example.com"
+password = "pw"
+"#;
+        std::fs::write(&path, toml_str).unwrap();
+        let config: Config =
+            toml::from_str(std::fs::read_to_string(&path).unwrap().as_str()).unwrap();
+        let config = Arc::new(tokio::sync::RwLock::new(config));
+
+        // 备注名定位（手动令牌账号的常态）
+        let rotation = ds_core::TokenRotation {
+            account: "主号".to_string(),
+            new_token: "NewRotatedToken9999".to_string(),
+        };
+        persist_token_rotation(&config, &path, &rotation)
+            .await
+            .expect("轮换应成功");
+
+        // 重新从磁盘加载，确认已持久化
+        let reloaded: Config =
+            toml::from_str(std::fs::read_to_string(&path).unwrap().as_str()).unwrap();
+        assert_eq!(reloaded.ds_core.accounts[0].token, "NewRotatedToken9999");
+        assert_eq!(reloaded.ds_core.accounts[0].remark, "主号");
+        // 其他账号不受影响
+        assert_eq!(reloaded.ds_core.accounts[1].email, "a@example.com");
+
+        // token 前缀名定位（无备注账号轮换后改名，用旧标识找不到 → Err）
+        let rotation = ds_core::TokenRotation {
+            account: "token-OldToken0".to_string(),
+            new_token: "x".to_string(),
+        };
+        assert!(
+            persist_token_rotation(&config, &path, &rotation)
+                .await
+                .is_err()
+        );
+
+        drop(std::fs::remove_dir_all(&dir));
     }
 
     /// 构造一个仅用于测试的 store（stats.json 落在临时目录）
